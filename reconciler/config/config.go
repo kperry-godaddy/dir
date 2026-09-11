@@ -69,7 +69,7 @@ type Config struct {
 	// Indexer holds the indexer task configuration.
 	Indexer indexer.Config `json:"indexer" mapstructure:"indexer"`
 
-	// Name holds the name (name/DNS verification) task configuration.
+	// Name holds the name ownership verification task configuration.
 	Name name.Config `json:"name" mapstructure:"name"`
 
 	// Signature holds the signature verification task configuration.
@@ -176,7 +176,7 @@ func LoadConfig() (*Config, error) {
 	v.SetDefault("indexer.interval", indexer.DefaultInterval)
 
 	//
-	// Name task configuration (name/DNS verification)
+	// Name task configuration (name ownership verification)
 	//
 	_ = v.BindEnv("name.enabled")
 	v.SetDefault("name.enabled", false)

@@ -42,11 +42,13 @@ The name task verifies ownership of named records and caches results. The protoc
 It:
 
 1. Queries the database for signed records with verifiable names that have no verification, an expired one (per `name.ttl`), or a scheduled retry that is due
-2. For each record, collects the signers: verified certificate signatures for `ans://` names, the attached public keys for the others
+2. For each record, collects the signers: the certificates bound to the record's signatures (a certificate counts only when its key produced the signature over the record CID) and the public keys attached to the record
 3. Runs the verification method selected by the name's protocol once per record
 4. Stores the result (`verified`, `failed`, or `pending`) in the database for efficient API filtering
 
-Records whose protocol has no method configured (for example `ans://` names while `name.ans.enabled` is false) are skipped without writing a row and counted in one warning per run, so enabling the method takes effect on the next run rather than after the TTL.
+Records whose protocol has no method configured (for example `ans://` names while `name.ans.enabled` is false) are skipped without writing a row and counted as `skipped` in the run summary, so enabling the method takes effect on the next run rather than after the TTL. Rows the method verified before it was disabled are served until their TTL and are not rewritten until it is enabled again.
+
+`name.record_timeout` bounds one record's attempt, including pulling its signatures and public keys from the store.
 
 #### ANS configuration
 
@@ -64,12 +66,39 @@ Slow DNS eats into the same `name.ans.timeout` budget as the log fetches; raise 
 
 #### Result states and retries
 
-- `verified` and `failed` are verdicts. They are re-checked after `name.ttl`. A revoked agent, a name that does not match the attested one, a missing or unattested certificate and an expired certificate are all `failed`.
-- `pending` means no verdict yet because every attempt failed transiently (DNS or the transparency log unreachable). Retries follow the schedule the scan task uses: the first retry after `name.interval`, doubling on each further strike, capped at 24 hours. A method that reports its dependency as down sets the retry time directly without counting a strike.
-- A previously verified record keeps `verified`, its certificate fingerprint and its details through transient failures until the TTL expires; only the retry state and the error change.
-- After 8 consecutive transient failures the row becomes `failed` with `verification unavailable after 8 consecutive transient failures; last: …` and is retried once a day.
+- `verified` and `failed` are verdicts. A verified row is served until `name.ttl` after the time it verified and re-checked after that; a failed row is re-checked after `name.ttl`. A revoked agent, a name that does not match the attested one, a missing or unattested certificate and an expired certificate are all `failed`.
+- `pending` means the last attempt failed transiently (DNS or the transparency log unreachable, or the record's signatures could not be read) and no verdict is served. The first retry lands on the next run; each further transient failure doubles the delay, up to 24 hours. A method that reports its dependency as down sets the retry time directly without counting a strike.
+- A verified record keeps its verdict, certificate fingerprint and details through transient failures until its TTL. After the TTL it is `pending` while its dependency stays down, still carrying what it last verified.
+- A record that has been `pending` for 24 hours (since its creation, or since the end of its TTL for a record demoted from `verified`) becomes `failed` with `verification unavailable for 24h; last: …` and retries once a day. A verified record is never demoted by a count of failures.
+- The stored error of a `pending` row starts with `transient: `. A record whose signatures could not be read stores `could not read the record's signatures`; the store error is in the reconciler log.
 
 `dirctl naming verify` reports the stored error for `pending` and `failed` rows.
+
+#### Diagnosing
+
+Start with the stored result of the record:
+
+```sh
+dirctl naming verify <cid> --output json
+```
+
+Then read the reconciler log:
+
+- `Name verification did not verify`: one line per attempt that did not verify, with `cid`, `recordName`, `method`, `error` (the stored text), `transient`, `status` and, when a retry was scheduled, `consecutiveFailures` and `nextAttemptAt`.
+- `Name verification complete`: one line per run with the `verified`, `failed`, `transient`, `skipped`, `aborted` and `persistFailed` counts and `durationMs`.
+- `Could not read the record's signatures`: the store error behind a `could not read the record's signatures` row.
+- `Transparency log circuit opened`: a trusted log failed repeatedly; records that depend on it are rescheduled until the circuit closes.
+- `Transparency log fetch failed`: the cause of one failed fetch from a log.
+
+Stored errors of the ANS method start with the stage that failed:
+
+| Prefix | Meaning |
+|--------|---------|
+| `ans dns:` | No `_ans-badge` record for the agent host (the SDK also accepts a legacy `_ra-badge` record), or the lookup timed out |
+| `ans badge-url:` | The badge points at a log that is not in `name.ans.trusted_log_hosts` |
+| `ans status-token:` | The log did not confirm the agent as active; `HTTP 410` means the agent is revoked or otherwise terminal |
+| `ans receipt:` | The agent's receipt could not be fetched or did not verify; `HTTP 503` means the event is not yet checkpointed, which is transient and leaves the row `pending` |
+| `ans certificate:` | The attached certificate is not the one attested for the agent, or it is expired or not yet valid |
 
 #### Operator steps
 
@@ -79,10 +108,10 @@ Rollback after removing the ANS method, so rows it verified do not stay verified
 UPDATE name_verifications SET status='failed', error='ans method removed' WHERE method='ans';
 ```
 
-Force re-verification of failed rows after fixing a bad configuration:
+Force re-verification of ANS rows on the next run after fixing a bad configuration; the rows are recreated without their retry schedule:
 
 ```sql
-UPDATE name_verifications SET next_attempt_at=CURRENT_TIMESTAMP WHERE method='ans' AND status='failed';
+DELETE FROM name_verifications WHERE method='ans' AND status IN ('failed','pending');
 ```
 
 ### Signature Task

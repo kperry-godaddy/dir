@@ -226,6 +226,28 @@ func TestGetRecordsNeedingVerification_ScheduleAndTTL(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "pending row with a future retry is not selected while fresh",
+			row:  &NameVerification{Status: VerificationStatusPending, NextAttemptAt: &future},
+			want: false,
+		},
+		{
+			name:     "pending row older than the ttl with a future retry is not selected",
+			row:      &NameVerification{Status: VerificationStatusPending, NextAttemptAt: &future},
+			ageAfter: 2 * ttl,
+			want:     false,
+		},
+		{
+			name:     "failed row older than the ttl with a future retry is not selected",
+			row:      &NameVerification{Status: VerificationStatusFailed, Error: "verification unavailable for 24h; last: boom", NextAttemptAt: &future},
+			ageAfter: 2 * ttl,
+			want:     false,
+		},
+		{
+			name: "failed row with a due retry is selected while fresh",
+			row:  &NameVerification{Status: VerificationStatusFailed, Error: "boom", NextAttemptAt: &due},
+			want: true,
+		},
+		{
 			name: "failed row without a schedule is not selected before the ttl",
 			row:  &NameVerification{Status: VerificationStatusFailed, Error: "boom"},
 			want: false,

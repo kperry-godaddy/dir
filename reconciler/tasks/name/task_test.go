@@ -26,17 +26,25 @@ import (
 )
 
 const (
-	taskTestCID     = signersTestCID
-	taskTestANSName = "ans://v1.0.0.agent.example.com/assistant"
-	taskTestHTTPS   = "https://example.com/agent"
-	taskTestDetails = `{"v":1,"ansName":"ans://v1.0.0.agent.example.com","agentId":"agent-1"}`
-	victimKeyID     = "SHA256:victim"
+	taskTestCID      = signersTestCID
+	taskTestOtherCID = "baeareitestsigners111111111111111111111111111111111111111111111"
+	taskTestANSName  = "ans://v1.0.0.agent.example.com/assistant"
+	taskTestHTTPS    = "https://example.com/agent"
+	taskTestDetails  = `{"v":1,"ansName":"ans://v1.0.0.agent.example.com","agentId":"agent-1"}`
+	victimKeyID      = "SHA256:victim"
+	dnsTimeoutText   = "ans dns: lookup timed out"
+	taskTestTTL      = 7 * 24 * time.Hour
+	taskTestInterval = time.Hour
 )
 
 var (
 	fixedNow       = time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 	errLookupDown  = errors.New("transport down")
 	errAgentRevoke = errors.New("ans status-token: agent revoked")
+	errDNSTimeout  = errors.Join(errors.New(dnsTimeoutText), naming.ErrTransient)
+
+	// existingVerifiedAt is when a verified row built by existingRow last verified.
+	existingVerifiedAt = fixedNow.Add(-2 * time.Hour)
 )
 
 // --- fakes ---
@@ -129,11 +137,12 @@ func (f *fakeDB) writes() int {
 }
 
 // fakeLookup is the ans:// method: it records the evidence it was given and
-// answers with configured keys or an error.
+// answers with configured keys or an error. onLookup, when set, runs first.
 type fakeLookup struct {
-	keys    []naming.PublicKey
-	details json.RawMessage
-	err     error
+	keys     []naming.PublicKey
+	details  json.RawMessage
+	err      error
+	onLookup func()
 
 	calls    int
 	evidence naming.Evidence
@@ -146,6 +155,10 @@ func (l *fakeLookup) LookupKeys(_ context.Context, name *naming.ParsedName, evid
 	l.calls++
 	l.evidence = evidence
 	l.name = name
+
+	if l.onLookup != nil {
+		l.onLookup()
+	}
 
 	if l.err != nil {
 		return nil, l.err
@@ -203,6 +216,71 @@ func at(offset time.Duration) *time.Time {
 	when := fixedNow.Add(offset)
 
 	return &when
+}
+
+// existingRow is a stored row of the given status: a verified one carries the
+// victim key, details and existingVerifiedAt; a failed one carries the
+// revocation error; a pending one was created three hours ago.
+func existingRow(status string, failures int) *gormdb.NameVerification {
+	row := &gormdb.NameVerification{
+		RecordCID:           taskTestCID,
+		Method:              string(naming.MethodANS),
+		Status:              status,
+		ConsecutiveFailures: failures,
+		CreatedAt:           fixedNow.Add(-3 * time.Hour),
+		UpdatedAt:           fixedNow.Add(-time.Hour),
+	}
+
+	switch status {
+	case gormdb.VerificationStatusVerified:
+		verifiedAt := existingVerifiedAt
+		row.KeyID = victimKeyID
+		row.Details = taskTestDetails
+		row.VerifiedAt = &verifiedAt
+	case gormdb.VerificationStatusFailed:
+		row.Error = errAgentRevoke.Error()
+	default:
+		row.Error = "transient: earlier"
+	}
+
+	return row
+}
+
+// pendingSinceRow is a pending row that stopped being served at the given
+// offset from now: a demoted verified row when it has a verification time, a
+// row created pending otherwise.
+func pendingSinceRow(since time.Duration, demoted bool, failures int) *gormdb.NameVerification {
+	row := existingRow(gormdb.VerificationStatusPending, failures)
+	row.CreatedAt = fixedNow.Add(since)
+
+	if demoted {
+		verifiedAt := fixedNow.Add(since - taskTestTTL)
+		row.CreatedAt = fixedNow.Add(-30 * 24 * time.Hour)
+		row.KeyID = victimKeyID
+		row.Details = taskTestDetails
+		row.VerifiedAt = &verifiedAt
+	}
+
+	return row
+}
+
+func verifiedResult() *naming.Result {
+	return &naming.Result{Verified: true, Domain: "agent.example.com", Method: string(naming.MethodANS), MatchedKeyID: victimKeyID, Details: json.RawMessage(taskTestDetails)}
+}
+
+func transientResult(errMsg string) *naming.Result {
+	return &naming.Result{Domain: "agent.example.com", Method: string(naming.MethodANS), Error: errMsg, Transient: true}
+}
+
+func retryAfterResult(errMsg string, until time.Time) *naming.Result {
+	result := transientResult(errMsg)
+	result.RetryAfter = until
+
+	return result
+}
+
+func terminalResult(errMsg string) *naming.Result {
+	return &naming.Result{Domain: "agent.example.com", Method: string(naming.MethodANS), Error: errMsg}
 }
 
 // --- basics ---
@@ -286,7 +364,7 @@ func TestTask_Run_ANSCopiedCertificateIsNotVerified(t *testing.T) {
 	row := db.created[0]
 	assert.Equal(t, gormdb.VerificationStatusFailed, row.GetStatus())
 	assert.Equal(t, string(naming.MethodANS), row.GetMethod())
-	assert.Equal(t, "no certificate attached to the record's signatures; sign with --certificate", row.GetError())
+	assert.Equal(t, "no signing keys attached to record", row.GetError())
 	assert.Nil(t, row.GetNextAttemptAt())
 	assert.Equal(t, 0, lookup.calls, "an unbound certificate never reaches the method")
 }
@@ -329,32 +407,32 @@ func TestTask_Run_UnparsableNameIsTerminal(t *testing.T) {
 
 	require.Len(t, db.created, 1)
 	assert.Equal(t, gormdb.VerificationStatusFailed, db.created[0].GetStatus())
+	assert.Equal(t, string(naming.MethodNone), db.created[0].GetMethod())
 	assert.Equal(t, "could not parse record name", db.created[0].GetError())
 	assert.Equal(t, 0, fetcher.sigCalls+fetcher.keyCalls)
 }
 
-func TestTask_Run_FetcherErrorIsTerminal(t *testing.T) {
+// A registry that cannot be read says nothing about the record: the row is
+// pending with a fixed message, retried on the next run, and the cause stays
+// in the log.
+func TestTask_Run_FetcherErrorIsTransientWithFixedText(t *testing.T) {
+	lookup := &fakeLookup{}
 	db := &fakeDB{records: ansRecords()}
-	fetcher := &fakeFetcher{sigErr: errors.New("registry unavailable")}
+	fetcher := &fakeFetcher{sigErr: errors.New("registry unavailable: dial tcp 10.0.0.1:5000")}
 
-	task := newTestTask(t, Config{Enabled: true}, db, fetcher, ansProvider(&fakeLookup{}))
+	task := newTestTask(t, Config{Enabled: true, Interval: taskTestInterval}, db, fetcher, ansProvider(lookup))
 	require.NoError(t, task.Run(t.Context()))
 
 	require.Len(t, db.created, 1)
-	assert.Equal(t, gormdb.VerificationStatusFailed, db.created[0].GetStatus())
-	assert.Equal(t, string(naming.MethodANS), db.created[0].GetMethod())
-	assert.Equal(t, "signers: pull signatures: registry unavailable", db.created[0].GetError())
-}
 
-func TestTask_Run_DatabaseReadErrorSkipsWrite(t *testing.T) {
-	victim := newTestIdentity(t, signersTestSAN)
-	lookup := &fakeLookup{keys: []naming.PublicKey{publishedKey(t, victim)}}
-	db := &fakeDB{records: ansRecords(), getErr: errors.New("db down")}
-
-	task := newTestTask(t, Config{Enabled: true}, db, &fakeFetcher{signatures: []*signv1.Signature{signedBy(t, victim)}}, ansProvider(lookup))
-	require.NoError(t, task.Run(t.Context()))
-
-	assert.Equal(t, 0, db.writes())
+	row := db.created[0]
+	assert.Equal(t, gormdb.VerificationStatusPending, row.GetStatus())
+	assert.Equal(t, string(naming.MethodANS), row.GetMethod())
+	assert.Equal(t, "transient: "+unreadableSignaturesMessage, row.GetError())
+	assert.NotContains(t, row.GetError(), "10.0.0.1")
+	assert.Equal(t, 1, row.GetConsecutiveFailures())
+	assert.Equal(t, at(taskTestInterval/2), row.GetNextAttemptAt())
+	assert.Equal(t, 0, lookup.calls)
 }
 
 // --- jwks lane ---
@@ -400,7 +478,7 @@ func TestTask_Run_HTTPSWithoutPublicKeysIsTerminal(t *testing.T) {
 	require.Len(t, db.created, 1)
 	assert.Equal(t, gormdb.VerificationStatusFailed, db.created[0].GetStatus())
 	assert.Equal(t, string(naming.MethodWellKnown), db.created[0].GetMethod())
-	assert.Equal(t, "no public keys found for record", db.created[0].GetError())
+	assert.Equal(t, "no signing keys attached to record", db.created[0].GetError())
 	assert.Equal(t, 0, wellKnown.calls)
 }
 
@@ -439,199 +517,279 @@ func TestPublicKeyDER(t *testing.T) {
 	}
 }
 
-// --- persistence state machine ---
+// --- state machine ---
 
-type writeKind int
+func TestTransition(t *testing.T) {
+	p := policy{ttl: taskTestTTL, interval: taskTestInterval}
+	retryAfter := retryAfterResult(errLookupDown.Error(), fixedNow.Add(10*time.Minute))
 
-const (
-	writeCreate writeKind = iota
-	writeUpdate
-)
-
-// existingVerifiedAt is when a verified row built by existingRow last verified.
-var existingVerifiedAt = fixedNow.Add(-2 * time.Hour)
-
-func existingRow(status string, failures int) *gormdb.NameVerification {
-	verifiedAt := existingVerifiedAt
-
-	row := &gormdb.NameVerification{
-		RecordCID:           taskTestCID,
-		Method:              string(naming.MethodANS),
-		Status:              status,
-		ConsecutiveFailures: failures,
-		UpdatedAt:           fixedNow.Add(-time.Hour),
+	verified := &gormdb.NameVerification{
+		RecordCID: taskTestCID, Method: string(naming.MethodANS), KeyID: victimKeyID,
+		Status: gormdb.VerificationStatusVerified, Details: taskTestDetails, VerifiedAt: &fixedNow,
+	}
+	revoked := &gormdb.NameVerification{
+		RecordCID: taskTestCID, Method: string(naming.MethodANS),
+		Status: gormdb.VerificationStatusFailed, Error: errAgentRevoke.Error(),
+	}
+	unavailable := &gormdb.NameVerification{
+		RecordCID: taskTestCID, Method: string(naming.MethodANS),
+		Status: gormdb.VerificationStatusFailed, Error: "verification unavailable for 24h; last: ans dns: lookup timed out",
 	}
 
-	switch status {
-	case gormdb.VerificationStatusVerified:
+	pending := func(failures int, next *time.Time) *gormdb.NameVerification {
+		return &gormdb.NameVerification{
+			RecordCID: taskTestCID, Method: string(naming.MethodANS), Status: gormdb.VerificationStatusPending,
+			Error: "transient: ans dns: lookup timed out", ConsecutiveFailures: failures, NextAttemptAt: next,
+		}
+	}
+	demoted := func(failures int, next *time.Time) *gormdb.NameVerification {
+		row := pending(failures, next)
 		row.KeyID = victimKeyID
 		row.Details = taskTestDetails
-		row.VerifiedAt = &verifiedAt
-	case gormdb.VerificationStatusFailed:
-		row.Error = errAgentRevoke.Error()
-	default:
-		row.Error = "transient: earlier"
+		row.VerifiedAt = &existingVerifiedAt
+
+		return row
+	}
+	keptVerified := func(errMsg string, failures int, next *time.Time) *gormdb.NameVerification {
+		row := demoted(failures, next)
+		row.Status = gormdb.VerificationStatusVerified
+		row.Error = errMsg
+
+		return row
 	}
 
-	return row
-}
-
-func TestTask_Run_PersistenceStateMachine(t *testing.T) {
-	victim := newTestIdentity(t, signersTestSAN)
-	transientErr := errors.Join(errors.New("ans dns: lookup timed out"), naming.ErrTransient)
-
 	tests := []struct {
-		name          string
-		interval      time.Duration
-		existing      *gormdb.NameVerification
-		lookupErr     error
-		lookupDetails json.RawMessage
-
-		want            writeKind
-		wantStatus      string
-		wantFailures    int
-		wantNext        *time.Time
-		wantErrContains string
-		wantErrEquals   string
-		wantKeyID       string
-		wantVerifiedAt  *time.Time
-		wantDetails     string
+		name     string
+		existing *gormdb.NameVerification
+		result   *naming.Result
+		want     *gormdb.NameVerification
+		wantKind outcomeKind
 	}{
 		{
-			name:            "transient with no row creates a pending row scheduled after one interval",
-			interval:        time.Hour,
-			lookupErr:       transientErr,
-			want:            writeCreate,
-			wantStatus:      gormdb.VerificationStatusPending,
-			wantFailures:    1,
-			wantNext:        at(time.Hour),
-			wantErrContains: "transient: ans dns: lookup timed out",
+			name:     "verified result with no row",
+			result:   verifiedResult(),
+			want:     verified,
+			wantKind: outcomeVerified,
 		},
 		{
-			name:            "transient on a verified row only reschedules and keeps the verdict",
-			interval:        time.Hour,
-			existing:        existingRow(gormdb.VerificationStatusVerified, 0),
-			lookupErr:       transientErr,
-			want:            writeUpdate,
-			wantStatus:      gormdb.VerificationStatusVerified,
-			wantFailures:    1,
-			wantNext:        at(time.Hour),
-			wantErrContains: "transient: ans dns: lookup timed out",
-			wantKeyID:       victimKeyID,
-			wantVerifiedAt:  &existingVerifiedAt,
-			wantDetails:     taskTestDetails,
+			name:     "verified result on a pending row resets the schedule",
+			existing: existingRow(gormdb.VerificationStatusPending, 5),
+			result:   verifiedResult(),
+			want:     verified,
+			wantKind: outcomeVerified,
 		},
 		{
-			name:            "third strike doubles twice",
-			interval:        time.Hour,
-			existing:        existingRow(gormdb.VerificationStatusPending, 2),
-			lookupErr:       transientErr,
-			want:            writeUpdate,
-			wantStatus:      gormdb.VerificationStatusPending,
-			wantFailures:    3,
-			wantNext:        at(4 * time.Hour),
-			wantErrContains: "transient: ans dns",
+			name:     "terminal failure on a verified row clears the verdict columns",
+			existing: existingRow(gormdb.VerificationStatusVerified, 2),
+			result:   terminalResult(errAgentRevoke.Error()),
+			want:     revoked,
+			wantKind: outcomeFailed,
 		},
 		{
-			name:            "backoff is capped at a day",
-			interval:        time.Hour,
-			existing:        existingRow(gormdb.VerificationStatusPending, 6),
-			lookupErr:       transientErr,
-			want:            writeUpdate,
-			wantStatus:      gormdb.VerificationStatusPending,
-			wantFailures:    7,
-			wantNext:        at(24 * time.Hour),
-			wantErrContains: "transient: ans dns",
+			name:     "terminal failure without text gets the generic message",
+			result:   terminalResult(""),
+			want:     &gormdb.NameVerification{RecordCID: taskTestCID, Method: string(naming.MethodANS), Status: gormdb.VerificationStatusFailed, Error: "verification failed"},
+			wantKind: outcomeFailed,
 		},
 		{
-			name:            "eighth strike becomes a failed verdict retried daily",
-			interval:        time.Hour,
-			existing:        existingRow(gormdb.VerificationStatusPending, 7),
-			lookupErr:       transientErr,
-			want:            writeUpdate,
-			wantStatus:      gormdb.VerificationStatusFailed,
-			wantFailures:    8,
-			wantNext:        at(24 * time.Hour),
-			wantErrContains: "verification unavailable after 8 consecutive transient failures; last: ans dns: lookup timed out",
+			name:     "transient with no row creates a pending row due on the next run",
+			result:   transientResult(dnsTimeoutText),
+			want:     pending(1, at(taskTestInterval/2)),
+			wantKind: outcomeTransient,
 		},
 		{
-			name:            "later strikes on an unavailable row renew the daily verdict",
-			interval:        time.Hour,
-			existing:        existingRow(gormdb.VerificationStatusFailed, 8),
-			lookupErr:       transientErr,
-			want:            writeUpdate,
-			wantStatus:      gormdb.VerificationStatusFailed,
-			wantFailures:    9,
-			wantNext:        at(24 * time.Hour),
-			wantErrContains: "verification unavailable after 8 consecutive transient failures",
+			name:     "third strike on a pending row lands two intervals out",
+			existing: existingRow(gormdb.VerificationStatusPending, 2),
+			result:   transientResult(dnsTimeoutText),
+			want:     pending(3, at(2*taskTestInterval)),
+			wantKind: outcomeTransient,
 		},
 		{
-			name:            "retry-after from the method sets the schedule without counting a strike",
-			interval:        time.Hour,
-			existing:        existingRow(gormdb.VerificationStatusPending, 3),
-			lookupErr:       &naming.RetryAfterError{Until: fixedNow.Add(10 * time.Minute), Err: errLookupDown},
-			want:            writeUpdate,
-			wantStatus:      gormdb.VerificationStatusPending,
-			wantFailures:    3,
-			wantNext:        at(10 * time.Minute),
-			wantErrContains: "transient: transport down",
+			name:     "backoff is capped at a day",
+			existing: existingRow(gormdb.VerificationStatusPending, 6),
+			result:   transientResult(dnsTimeoutText),
+			want:     pending(7, at(maxRetryDelay)),
+			wantKind: outcomeTransient,
 		},
 		{
-			name:            "retry-after with no row creates a pending row without a strike",
-			interval:        time.Hour,
-			lookupErr:       &naming.RetryAfterError{Until: fixedNow.Add(10 * time.Minute), Err: errLookupDown},
-			want:            writeCreate,
-			wantStatus:      gormdb.VerificationStatusPending,
-			wantFailures:    0,
-			wantNext:        at(10 * time.Minute),
-			wantErrContains: "transient: transport down",
+			name:     "transient on a verified row before its ttl keeps it verified",
+			existing: existingRow(gormdb.VerificationStatusVerified, 0),
+			result:   transientResult(dnsTimeoutText),
+			want:     keptVerified("transient: ans dns: lookup timed out", 1, at(taskTestInterval/2)),
+			wantKind: outcomeTransient,
 		},
 		{
-			name:          "transient on a failed row keeps failed and its own error",
-			interval:      time.Hour,
-			existing:      existingRow(gormdb.VerificationStatusFailed, 0),
-			lookupErr:     transientErr,
-			want:          writeUpdate,
-			wantStatus:    gormdb.VerificationStatusFailed,
-			wantFailures:  1,
-			wantNext:      at(time.Hour),
-			wantErrEquals: errAgentRevoke.Error(),
+			name:     "transient on a verified row past its ttl makes it pending and keeps what it verified",
+			existing: pendingSinceRow(0, true, 0),
+			result:   transientResult(dnsTimeoutText),
+			want: func() *gormdb.NameVerification {
+				row := demoted(1, at(taskTestInterval/2))
+				expired := fixedNow.Add(-taskTestTTL)
+				row.VerifiedAt = &expired
+
+				return row
+			}(),
+			wantKind: outcomeTransient,
 		},
 		{
-			name:          "terminal after transient strikes clears the schedule",
-			interval:      time.Hour,
-			existing:      existingRow(gormdb.VerificationStatusPending, 3),
-			lookupErr:     errAgentRevoke,
-			want:          writeUpdate,
-			wantStatus:    gormdb.VerificationStatusFailed,
-			wantFailures:  0,
-			wantErrEquals: errAgentRevoke.Error(),
+			name: "transient on a verified row without a verification time makes it pending",
+			existing: func() *gormdb.NameVerification {
+				row := existingRow(gormdb.VerificationStatusVerified, 0)
+				row.VerifiedAt = nil
+
+				return row
+			}(),
+			result: transientResult(dnsTimeoutText),
+			want: func() *gormdb.NameVerification {
+				row := demoted(1, at(taskTestInterval/2))
+				row.VerifiedAt = nil
+
+				return row
+			}(),
+			wantKind: outcomeTransient,
 		},
 		{
-			name:           "success after transient strikes resets the counters",
-			interval:       time.Hour,
-			existing:       existingRow(gormdb.VerificationStatusPending, 5),
-			lookupDetails:  json.RawMessage(taskTestDetails),
-			want:           writeUpdate,
-			wantStatus:     gormdb.VerificationStatusVerified,
-			wantFailures:   0,
-			wantKeyID:      victimKeyID,
-			wantVerifiedAt: &fixedNow,
-			wantDetails:    taskTestDetails,
+			name:     "transient on a failed row keeps failed and its own error",
+			existing: existingRow(gormdb.VerificationStatusFailed, 0),
+			result:   transientResult(dnsTimeoutText),
+			want: &gormdb.NameVerification{
+				RecordCID: taskTestCID, Method: string(naming.MethodANS), Status: gormdb.VerificationStatusFailed,
+				Error: errAgentRevoke.Error(), ConsecutiveFailures: 1, NextAttemptAt: at(taskTestInterval / 2),
+			},
+			wantKind: outcomeTransient,
 		},
 		{
-			name:           "success without details stores an empty string, not null",
-			interval:       time.Hour,
-			want:           writeCreate,
-			wantStatus:     gormdb.VerificationStatusVerified,
-			wantKeyID:      victimKeyID,
-			wantVerifiedAt: &fixedNow,
+			name:     "retry-after on a pending row sets the schedule without a strike",
+			existing: existingRow(gormdb.VerificationStatusPending, 3),
+			result:   retryAfter,
+			want: &gormdb.NameVerification{
+				RecordCID: taskTestCID, Method: string(naming.MethodANS), Status: gormdb.VerificationStatusPending,
+				Error: "transient: transport down", ConsecutiveFailures: 3, NextAttemptAt: at(10 * time.Minute),
+			},
+			wantKind: outcomeTransient,
+		},
+		{
+			name:     "retry-after on a verified row keeps the verdict without a strike",
+			existing: existingRow(gormdb.VerificationStatusVerified, 0),
+			result:   retryAfter,
+			want:     keptVerified("transient: transport down", 0, at(10*time.Minute)),
+			wantKind: outcomeTransient,
+		},
+		{
+			name:   "retry-after with no row creates a pending row without a strike",
+			result: retryAfter,
+			want: &gormdb.NameVerification{
+				RecordCID: taskTestCID, Method: string(naming.MethodANS), Status: gormdb.VerificationStatusPending,
+				Error: "transient: transport down", NextAttemptAt: at(10 * time.Minute),
+			},
+			wantKind: outcomeTransient,
+		},
+		{
+			name:     "row pending for a day becomes failed until a daily retry",
+			existing: pendingSinceRow(-pendingBudget, false, 6),
+			result:   transientResult(dnsTimeoutText),
+			want: func() *gormdb.NameVerification {
+				row := *unavailable
+				row.ConsecutiveFailures = 7
+				row.NextAttemptAt = at(maxRetryDelay)
+
+				return &row
+			}(),
+			wantKind: outcomeFailed,
+		},
+		{
+			name:     "row pending for less than a day stays pending",
+			existing: pendingSinceRow(-pendingBudget+time.Hour, false, 6),
+			result:   transientResult(dnsTimeoutText),
+			want:     pending(7, at(maxRetryDelay)),
+			wantKind: outcomeTransient,
+		},
+		{
+			name:     "row demoted from verified is pending for a day after its ttl before failing",
+			existing: pendingSinceRow(-pendingBudget, true, 2),
+			result:   transientResult(dnsTimeoutText),
+			want: func() *gormdb.NameVerification {
+				row := *unavailable
+				row.ConsecutiveFailures = 3
+				row.NextAttemptAt = at(maxRetryDelay)
+
+				return &row
+			}(),
+			wantKind: outcomeFailed,
+		},
+		{
+			name:     "row demoted from verified stays pending within a day of its ttl however old the row",
+			existing: pendingSinceRow(-pendingBudget+time.Hour, true, 2),
+			result:   transientResult(dnsTimeoutText),
+			want: func() *gormdb.NameVerification {
+				row := demoted(3, at(2*taskTestInterval))
+				verifiedAt := fixedNow.Add(-pendingBudget + time.Hour - taskTestTTL)
+				row.VerifiedAt = &verifiedAt
+
+				return row
+			}(),
+			wantKind: outcomeTransient,
+		},
+		{
+			name:     "retry-after does not extend the pending budget",
+			existing: pendingSinceRow(-pendingBudget-6*time.Hour, false, 4),
+			result:   retryAfter,
+			want: &gormdb.NameVerification{
+				RecordCID: taskTestCID, Method: string(naming.MethodANS), Status: gormdb.VerificationStatusFailed,
+				Error: "verification unavailable for 24h; last: transport down", ConsecutiveFailures: 4, NextAttemptAt: at(maxRetryDelay),
+			},
+			wantKind: outcomeFailed,
+		},
+		{
+			name: "row with an unknown status is treated as pending",
+			existing: func() *gormdb.NameVerification {
+				row := existingRow(gormdb.VerificationStatusPending, 0)
+				row.Status = "weird"
+
+				return row
+			}(),
+			result:   transientResult(dnsTimeoutText),
+			want:     pending(1, at(taskTestInterval/2)),
+			wantKind: outcomeTransient,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			lookup := &fakeLookup{err: tc.lookupErr, details: tc.lookupDetails}
+			var existing types.NameVerificationObject
+			if tc.existing != nil {
+				existing = tc.existing
+			}
+
+			got := transition(taskTestCID, existing, tc.result, fixedNow, p)
+
+			assert.Equal(t, tc.wantKind, got.kind)
+			assert.Equal(t, tc.want, got.row)
+		})
+	}
+}
+
+// Run loads the row once, calls Verify once and writes the transition once:
+// a create when there is no row, an update otherwise.
+func TestTask_Run_WritesTheTransitionOnce(t *testing.T) {
+	victim := newTestIdentity(t, signersTestSAN)
+
+	tests := []struct {
+		name       string
+		existing   *gormdb.NameVerification
+		lookupErr  error
+		wantCreate bool
+		wantStatus string
+	}{
+		{name: "transient with no row is created pending", lookupErr: errDNSTimeout, wantCreate: true, wantStatus: gormdb.VerificationStatusPending},
+		{name: "transient on a verified row is updated in place", existing: existingRow(gormdb.VerificationStatusVerified, 0), lookupErr: errDNSTimeout, wantStatus: gormdb.VerificationStatusVerified},
+		{name: "verified result on a pending row is updated", existing: existingRow(gormdb.VerificationStatusPending, 5), wantStatus: gormdb.VerificationStatusVerified},
+		{name: "terminal result with no row is created failed", lookupErr: errAgentRevoke, wantCreate: true, wantStatus: gormdb.VerificationStatusFailed},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			lookup := &fakeLookup{err: tc.lookupErr, details: json.RawMessage(taskTestDetails)}
 			if tc.lookupErr == nil {
 				lookup.keys = []naming.PublicKey{publishedKey(t, victim)}
 			}
@@ -639,59 +797,116 @@ func TestTask_Run_PersistenceStateMachine(t *testing.T) {
 			db := &fakeDB{records: ansRecords(), existing: tc.existing}
 			fetcher := &fakeFetcher{signatures: []*signv1.Signature{signedBy(t, victim)}}
 
-			task := newTestTask(t, Config{Enabled: true, Interval: tc.interval}, db, fetcher, ansProvider(lookup))
+			task := newTestTask(t, Config{Enabled: true, Interval: taskTestInterval}, db, fetcher, ansProvider(lookup))
 			require.NoError(t, task.Run(t.Context()))
 
 			require.Equal(t, 1, db.writes(), "exactly one write per record")
+			assert.Equal(t, 1, lookup.calls, "exactly one Verify per record")
+			assert.Equal(t, 1, fetcher.sigCalls)
 
-			rows := db.created
-			if tc.want == writeUpdate {
-				rows = db.updated
+			rows := db.updated
+			if tc.wantCreate {
+				rows = db.created
 			}
 
 			require.Len(t, rows, 1)
-
-			row := rows[0]
-			assert.Equal(t, taskTestCID, row.GetRecordCID())
-			assert.Equal(t, string(naming.MethodANS), row.GetMethod())
-			assert.Equal(t, tc.wantStatus, row.GetStatus())
-			assert.Equal(t, tc.wantFailures, row.GetConsecutiveFailures())
-			assert.Equal(t, tc.wantNext, row.GetNextAttemptAt())
-			assert.Equal(t, tc.wantKeyID, row.GetKeyID())
-			assert.Equal(t, tc.wantDetails, row.GetDetails())
-			assert.Equal(t, tc.wantVerifiedAt, row.GetVerifiedAt())
-
-			if tc.wantErrEquals != "" {
-				assert.Equal(t, tc.wantErrEquals, row.GetError())
-			}
-
-			if tc.wantErrContains != "" {
-				assert.Contains(t, row.GetError(), tc.wantErrContains)
-			}
+			assert.Equal(t, taskTestCID, rows[0].GetRecordCID())
+			assert.Equal(t, tc.wantStatus, rows[0].GetStatus())
 		})
 	}
 }
 
-func TestScheduleStatus(t *testing.T) {
+func TestTask_VerifyRecord_PersistFailures(t *testing.T) {
+	victim := newTestIdentity(t, signersTestSAN)
+	writeErr := errors.New("disk full")
+
 	tests := []struct {
-		name       string
-		existing   *gormdb.NameVerification
-		wantStatus string
-		wantErr    string
+		name string
+		db   *fakeDB
 	}{
-		{name: "verified stays verified with the transient error", existing: existingRow(gormdb.VerificationStatusVerified, 0), wantStatus: gormdb.VerificationStatusVerified, wantErr: "transient: now"},
-		{name: "failed stays failed with its own error", existing: existingRow(gormdb.VerificationStatusFailed, 0), wantStatus: gormdb.VerificationStatusFailed, wantErr: errAgentRevoke.Error()},
-		{name: "pending stays pending with the transient error", existing: existingRow(gormdb.VerificationStatusPending, 1), wantStatus: gormdb.VerificationStatusPending, wantErr: "transient: now"},
-		{name: "unknown status becomes pending", existing: &gormdb.NameVerification{Status: "weird"}, wantStatus: gormdb.VerificationStatusPending, wantErr: "transient: now"},
+		{name: "row cannot be loaded", db: &fakeDB{getErr: errors.New("db down")}},
+		{name: "row cannot be created", db: &fakeDB{createErr: writeErr}},
+		{name: "row cannot be updated", db: &fakeDB{existing: existingRow(gormdb.VerificationStatusPending, 1), updateErr: writeErr}},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			status, errMsg := scheduleStatus(tc.existing, "transient: now")
-			assert.Equal(t, tc.wantStatus, status)
-			assert.Equal(t, tc.wantErr, errMsg)
+			lookup := &fakeLookup{keys: []naming.PublicKey{publishedKey(t, victim)}}
+			fetcher := &fakeFetcher{signatures: []*signv1.Signature{signedBy(t, victim)}}
+
+			task := newTestTask(t, Config{Enabled: true}, tc.db, fetcher, ansProvider(lookup))
+
+			got := task.verifyRecord(t.Context(), taskTestCID, taskTestANSName)
+
+			assert.Equal(t, outcomePersistFailed, got.kind)
+			assert.Equal(t, string(naming.MethodANS), got.method)
+			assert.Equal(t, 1, lookup.calls)
 		})
 	}
+}
+
+func TestTask_Run_StopsBeforeEachRecordOnceCanceled(t *testing.T) {
+	victim := newTestIdentity(t, signersTestSAN)
+	lookup := &fakeLookup{keys: []naming.PublicKey{publishedKey(t, victim)}}
+	fetcher := &fakeFetcher{signatures: []*signv1.Signature{signedBy(t, victim)}}
+	db := &fakeDB{records: []coretypes.Record{
+		&fakeRecord{cid: taskTestCID, name: taskTestANSName},
+		&fakeRecord{cid: taskTestOtherCID, name: taskTestANSName},
+	}}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	task := newTestTask(t, Config{Enabled: true}, db, fetcher, ansProvider(lookup))
+
+	err := task.Run(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorContains(t, err, "stopped after 0 of 2 records")
+	assert.Equal(t, 0, db.writes())
+	assert.Equal(t, 0, lookup.calls)
+	assert.Equal(t, 0, fetcher.sigCalls)
+}
+
+// A failure observed after the run was canceled may be the cancellation's own
+// doing, so nothing is written for it and the batch stops.
+func TestTask_Run_CancellationDuringARecordWritesNothing(t *testing.T) {
+	victim := newTestIdentity(t, signersTestSAN)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	lookup := &fakeLookup{err: errDNSTimeout, onLookup: cancel}
+	fetcher := &fakeFetcher{signatures: []*signv1.Signature{signedBy(t, victim)}}
+	db := &fakeDB{records: []coretypes.Record{
+		&fakeRecord{cid: taskTestCID, name: taskTestANSName},
+		&fakeRecord{cid: taskTestOtherCID, name: taskTestANSName},
+	}}
+
+	task := newTestTask(t, Config{Enabled: true}, db, fetcher, ansProvider(lookup))
+
+	err := task.Run(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorContains(t, err, "stopped after 1 of 2 records")
+	assert.Equal(t, 0, db.writes())
+	assert.Equal(t, 1, lookup.calls)
+}
+
+func TestTask_VerifyRecord_SuccessAfterCancellationIsStored(t *testing.T) {
+	victim := newTestIdentity(t, signersTestSAN)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	lookup := &fakeLookup{keys: []naming.PublicKey{publishedKey(t, victim)}, onLookup: cancel}
+	db := &fakeDB{}
+
+	task := newTestTask(t, Config{Enabled: true}, db, &fakeFetcher{signatures: []*signv1.Signature{signedBy(t, victim)}}, ansProvider(lookup))
+
+	got := task.verifyRecord(ctx, taskTestCID, taskTestANSName)
+
+	assert.Equal(t, outcomeVerified, got.kind)
+	require.Len(t, db.created, 1)
+	assert.Equal(t, gormdb.VerificationStatusVerified, db.created[0].GetStatus())
 }
 
 func TestRunSummary(t *testing.T) {
@@ -703,16 +918,20 @@ func TestRunSummary(t *testing.T) {
 	summary.add(outcome{kind: outcomeTransient, method: "ans"})
 	summary.add(outcome{kind: outcomeSkipped, protocol: naming.ANSProtocol})
 	summary.add(outcome{kind: outcomeSkipped, protocol: naming.ANSProtocol})
+	summary.add(outcome{kind: outcomeAborted, method: "ans"})
+	summary.add(outcome{kind: outcomePersistFailed, method: "ans"})
 
 	assert.Equal(t, 2, summary.verified)
 	assert.Equal(t, 1, summary.failed)
 	assert.Equal(t, 1, summary.transient)
 	assert.Equal(t, 2, summary.skipped)
+	assert.Equal(t, 1, summary.aborted)
+	assert.Equal(t, 1, summary.persistFailed)
 	assert.Equal(t, map[string]int{"ans": 1, "wellknown": 1}, summary.verifiedByMethod)
 	assert.Equal(t, map[string]int{"ans": 1}, summary.failedByMethod)
 	assert.Equal(t, map[string]int{naming.ANSProtocol: 2}, summary.skippedByProtocol)
 
-	summary.log()
+	summary.log(time.Second)
 }
 
 // The record's signed payload is exactly the CID string: the reconciler's
@@ -732,57 +951,6 @@ func TestCertificateSigners_MatchesClientPayloadShape(t *testing.T) {
 	parsed, err := x509.ParsePKIXPublicKey(signers[0].Key)
 	require.NoError(t, err)
 	assert.Equal(t, &victim.key.PublicKey, parsed)
-}
-
-// Write failures are logged and must not abort the run or panic.
-func TestTask_Run_WriteFailuresAreTolerated(t *testing.T) {
-	victim := newTestIdentity(t, signersTestSAN)
-	transientErr := errors.Join(errors.New("ans dns: lookup timed out"), naming.ErrTransient)
-	writeErr := errors.New("disk full")
-
-	tests := []struct {
-		name      string
-		existing  *gormdb.NameVerification
-		lookupErr error
-		db        func() *fakeDB
-	}{
-		{name: "create verdict fails", db: func() *fakeDB { return &fakeDB{createErr: writeErr} }},
-		{name: "update verdict fails", existing: existingRow(gormdb.VerificationStatusPending, 1), db: func() *fakeDB { return &fakeDB{updateErr: writeErr} }},
-		{name: "create pending fails", lookupErr: transientErr, db: func() *fakeDB { return &fakeDB{createErr: writeErr} }},
-		{name: "schedule write fails", existing: existingRow(gormdb.VerificationStatusVerified, 0), lookupErr: transientErr, db: func() *fakeDB { return &fakeDB{updateErr: writeErr} }},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			lookup := &fakeLookup{err: tc.lookupErr}
-			if tc.lookupErr == nil {
-				lookup.keys = []naming.PublicKey{publishedKey(t, victim)}
-			}
-
-			db := tc.db()
-			db.records = ansRecords()
-			db.existing = tc.existing
-
-			task := newTestTask(t, Config{Enabled: true}, db, &fakeFetcher{signatures: []*signv1.Signature{signedBy(t, victim)}}, ansProvider(lookup))
-			require.NoError(t, task.Run(t.Context()))
-			assert.Equal(t, 1, db.writes())
-		})
-	}
-}
-
-func TestTask_Run_CanceledContextIsTerminal(t *testing.T) {
-	victim := newTestIdentity(t, signersTestSAN)
-	db := &fakeDB{records: ansRecords()}
-
-	ctx, cancel := context.WithCancel(t.Context())
-	cancel()
-
-	task := newTestTask(t, Config{Enabled: true}, db, &fakeFetcher{signatures: []*signv1.Signature{signedBy(t, victim)}}, ansProvider(&fakeLookup{}))
-	require.NoError(t, task.Run(ctx))
-
-	require.Len(t, db.created, 1)
-	assert.Equal(t, gormdb.VerificationStatusFailed, db.created[0].GetStatus())
-	assert.Contains(t, db.created[0].GetError(), "signers: certificate signers: context canceled")
 }
 
 func TestFailedRow_DefaultMessage(t *testing.T) {

@@ -26,17 +26,17 @@ import (
 var logger = logging.Logger("reconciler/name")
 
 const (
-	// maxConsecutiveTransients is the number of transient failures in a row
-	// after which a record is recorded as failed instead of pending, so a
-	// dependency that stays down does not leave the record undecided forever.
-	maxConsecutiveTransients = 8
-
-	// maxRetryDelay caps the doubling backoff between transient retries.
+	// maxRetryDelay caps the doubling backoff between transient retries and is
+	// how long a record recorded as unavailable waits before its next attempt.
 	maxRetryDelay = 24 * time.Hour
 
-	// unavailableRetryDelay is how long a record recorded as failed after
-	// maxConsecutiveTransients waits before its next attempt.
-	unavailableRetryDelay = 24 * time.Hour
+	// pendingBudget is how long a record may stay pending before it is
+	// recorded as failed.
+	pendingBudget = 24 * time.Hour
+
+	// unreadableSignaturesMessage is stored when the record's signatures could
+	// not be pulled. The cause is logged, never stored.
+	unreadableSignaturesMessage = "could not read the record's signatures"
 )
 
 // Task implements the name reconciler task (name ownership verification).
@@ -76,8 +76,11 @@ func (t *Task) IsEnabled() bool {
 	return t.config.Enabled
 }
 
-// Run executes name verification: fetch records needing verification, then verify each.
+// Run executes name verification: fetch records needing verification, then
+// verify each. It stops at the first record for which ctx is done.
 func (t *Task) Run(ctx context.Context) error {
+	started := t.now()
+
 	logger.Debug("Running name verification")
 
 	records, err := t.db.GetRecordsNeedingVerification(t.config.GetTTL())
@@ -95,44 +98,51 @@ func (t *Task) Run(ctx context.Context) error {
 
 	summary := newRunSummary()
 
-	for _, r := range records {
-		recordCtx, cancel := context.WithTimeout(ctx, t.config.GetRecordTimeout())
-		summary.add(t.verifyRecord(recordCtx, r.GetCid(), r.GetName()))
-		cancel()
+	for i, r := range records {
+		if err := ctx.Err(); err != nil {
+			summary.log(t.now().Sub(started))
+
+			return fmt.Errorf("name verification stopped after %d of %d records: %w", i, len(records), err)
+		}
+
+		summary.add(t.verifyRecord(ctx, r.GetCid(), r.GetName()))
 	}
 
-	summary.log()
+	summary.log(t.now().Sub(started))
 
 	return nil
 }
 
-// verifyRecord verifies ownership of one record's name and records the result.
+// verifyRecord verifies ownership of one record's name within the record
+// timeout and records the result.
 func (t *Task) verifyRecord(ctx context.Context, cid, recordName string) outcome {
 	started := t.now()
 
 	parsed := naming.ParseName(recordName)
 	if parsed == nil {
-		return t.recordResult(cid, recordName, &naming.Result{Error: "could not parse record name"}, started)
+		return t.recordResult(ctx, cid, recordName, &naming.Result{Method: string(naming.MethodNone), Error: "could not parse record name"}, started)
 	}
 
-	if t.provider.Method(parsed.Protocol) == naming.MethodNone {
+	method := t.provider.Method(parsed.Protocol)
+	if method == naming.MethodNone {
 		logger.Debug("Skipping record: no verification method for its protocol", "cid", cid, "protocol", parsed.Protocol)
 
 		return outcome{kind: outcomeSkipped, protocol: parsed.Protocol}
 	}
 
-	method := methodFor(parsed.Protocol)
+	recordCtx, cancel := context.WithTimeout(ctx, t.config.GetRecordTimeout())
+	defer cancel()
 
-	signers, err := t.collectSigners(ctx, cid, parsed)
+	signers, err := t.collectSigners(recordCtx, cid, parsed)
 	if err != nil {
-		return t.recordResult(cid, recordName, &naming.Result{Domain: parsed.Domain, Method: method, Error: "signers: " + err.Error()}, started)
+		logger.Warn("Could not read the record's signatures", "cid", cid, "recordName", recordName, "error", err)
+
+		result := &naming.Result{Domain: parsed.Domain, Method: string(method), Error: unreadableSignaturesMessage, Transient: true}
+
+		return t.recordResult(ctx, cid, recordName, result, started)
 	}
 
-	if len(signers) == 0 {
-		return t.recordResult(cid, recordName, &naming.Result{Domain: parsed.Domain, Method: method, Error: noSignersMessage(parsed.Protocol)}, started)
-	}
-
-	return t.recordResult(cid, recordName, t.provider.Verify(ctx, recordName, signers), started)
+	return t.recordResult(ctx, cid, recordName, t.provider.Verify(recordCtx, recordName, signers), started)
 }
 
 // collectSigners gathers the parties that signed the record. For ans:// names
@@ -201,137 +211,110 @@ func publicKeyDER(key string) ([]byte, error) {
 	return der, nil
 }
 
-// methodFor names the verification method the provider runs for a supported
-// protocol, for results recorded before Verify is reached.
-func methodFor(protocol string) string {
-	if protocol == naming.ANSProtocol {
-		return string(naming.MethodANS)
+// recordResult folds the result into the record's row and logs the attempt. A
+// failure is not persisted once ctx is done, because it may be the
+// cancellation's own doing.
+func (t *Task) recordResult(ctx context.Context, cid, recordName string, result *naming.Result, started time.Time) outcome {
+	if !result.Verified && ctx.Err() != nil {
+		logger.Warn("Name verification aborted", "cid", cid, "recordName", recordName, "method", result.Method, "error", result.Error)
+
+		return outcome{kind: outcomeAborted, method: result.Method}
 	}
 
-	return string(naming.MethodWellKnown)
-}
+	existing, err := t.db.GetVerificationByCID(cid)
+	if err != nil && !errors.Is(err, gormdb.ErrVerificationNotFound) {
+		logger.Error("Failed to load name verification", "cid", cid, "error", err)
 
-// noSignersMessage explains a record without signers in the terms of its method.
-func noSignersMessage(protocol string) string {
-	if protocol == naming.ANSProtocol {
-		return "no certificate attached to the record's signatures; sign with --certificate"
+		return outcome{kind: outcomePersistFailed, method: result.Method}
 	}
 
-	return "no public keys found for record"
+	next := transition(cid, existing, result, t.now(), policy{ttl: t.config.GetTTL(), interval: t.config.GetInterval()})
+
+	if err := t.write(existing != nil, next.row); err != nil {
+		logger.Error("Failed to store name verification", "cid", cid, "status", next.row.Status, "error", err)
+
+		return outcome{kind: outcomePersistFailed, method: result.Method}
+	}
+
+	t.logAttempt(cid, recordName, result, next.row, t.now().Sub(started))
+
+	return outcome{kind: next.kind, method: next.row.Method}
 }
 
-// recordResult persists and logs the result of one attempt.
-func (t *Task) recordResult(cid, recordName string, result *naming.Result, started time.Time) outcome {
-	t.persist(cid, result)
+// write creates the record's row or replaces the existing one.
+func (t *Task) write(exists bool, row *gormdb.NameVerification) error {
+	if exists {
+		return t.db.UpdateNameVerification(row) //nolint:wrapcheck // logged with its context by the caller
+	}
 
-	elapsedMs := t.now().Sub(started).Milliseconds()
+	return t.db.CreateNameVerification(row) //nolint:wrapcheck // logged with its context by the caller
+}
 
+// logAttempt reports one persisted attempt with the row it produced.
+func (t *Task) logAttempt(cid, recordName string, result *naming.Result, row *gormdb.NameVerification, elapsed time.Duration) {
 	if result.Verified {
 		logger.Info("Name verification succeeded",
 			"cid", cid,
 			"recordName", recordName,
 			"domain", result.Domain,
-			"method", result.Method,
-			"keyID", result.MatchedKeyID,
-			"elapsedMs", elapsedMs)
+			"method", row.Method,
+			"keyID", row.KeyID,
+			"elapsedMs", elapsed.Milliseconds())
 
-		return outcome{kind: outcomeVerified, method: result.Method}
+		return
 	}
 
-	logger.Warn("Name verification did not verify",
+	attrs := []any{
 		"cid", cid,
 		"recordName", recordName,
 		"domain", result.Domain,
-		"method", result.Method,
-		"error", result.Error,
+		"method", row.Method,
+		"error", row.Error,
 		"transient", result.Transient,
-		"elapsedMs", elapsedMs)
-
-	if result.Transient {
-		return outcome{kind: outcomeTransient, method: result.Method}
+		"status", row.Status,
+		"elapsedMs", elapsed.Milliseconds(),
 	}
 
-	return outcome{kind: outcomeFailed, method: result.Method}
+	if row.NextAttemptAt != nil {
+		attrs = append(attrs, "consecutiveFailures", row.ConsecutiveFailures, "nextAttemptAt", *row.NextAttemptAt)
+	}
+
+	logger.Warn("Name verification did not verify", attrs...)
 }
 
-// persist writes the result to the record's row. A verdict (verified or
-// terminal failure) replaces the row; a transient failure only advances the
-// retry state, so the previous verdict stays readable.
-func (t *Task) persist(cid string, result *naming.Result) {
-	existing, err := t.db.GetVerificationByCID(cid)
-	if err != nil && !errors.Is(err, gormdb.ErrVerificationNotFound) {
-		logger.Warn("Failed to load existing name verification", "cid", cid, "error", err)
+// policy is the timing the state machine applies.
+type policy struct {
+	// ttl is how long a verified verdict is served.
+	ttl time.Duration
 
-		return
-	}
+	// interval is the task interval; the first retry lands on the next run.
+	interval time.Duration
+}
 
-	now := t.now()
+// step is the row one attempt produces and how the run counts it.
+type step struct {
+	row  *gormdb.NameVerification
+	kind outcomeKind
+}
 
+// transition folds the result of one attempt into the record's row. A verdict
+// replaces the row. A transient failure advances the retry schedule and keeps
+// the verdict columns: a verified row stays verified until its TTL and is
+// pending after it, a failed row stays failed with its own error, and a row
+// pending for pendingBudget becomes failed until its daily retry.
+func transition(cid string, existing types.NameVerificationObject, result *naming.Result, now time.Time, p policy) step {
 	switch {
 	case result.Verified:
-		t.writeVerdict(cid, existing, verifiedRow(cid, result, now))
+		return step{row: verifiedRow(cid, result, now), kind: outcomeVerified}
 	case result.Transient:
-		t.recordTransient(cid, existing, result, now)
+		return transientStep(cid, existing, result, now, p)
 	default:
-		t.writeVerdict(cid, existing, failedRow(cid, result.Method, result.Error))
+		return step{row: failedRow(cid, result.Method, result.Error), kind: outcomeFailed}
 	}
 }
 
-// recordTransient advances the retry state after a transient failure. Each
-// strike doubles the delay from the task interval up to maxRetryDelay. A retry
-// time named by the method (its circuit breaker is open) is used as is and does
-// not count as a strike. At maxConsecutiveTransients the row becomes a failed
-// verdict that retries once a day; the counter keeps climbing across those
-// daily attempts so its value shows how long the dependency has been down.
-func (t *Task) recordTransient(cid string, existing types.NameVerificationObject, result *naming.Result, now time.Time) {
-	failures := 0
-	if existing != nil {
-		failures = existing.GetConsecutiveFailures()
-	}
-
-	if !result.RetryAfter.IsZero() {
-		t.writeSchedule(cid, existing, result, failures, result.RetryAfter)
-
-		return
-	}
-
-	failures++
-
-	if failures >= maxConsecutiveTransients {
-		nextAttemptAt := now.Add(unavailableRetryDelay)
-		row := failedRow(cid, result.Method,
-			fmt.Sprintf("verification unavailable after %d consecutive transient failures; last: %s", maxConsecutiveTransients, result.Error))
-		row.ConsecutiveFailures = failures
-		row.NextAttemptAt = &nextAttemptAt
-
-		t.writeVerdict(cid, existing, row)
-
-		return
-	}
-
-	schedule := types.ScanSchedule{RetryBase: t.config.GetInterval(), RetryMax: maxRetryDelay}
-
-	t.writeSchedule(cid, existing, result, failures, schedule.NextAttempt(now, failures))
-}
-
-// writeVerdict creates or replaces the record's row with a verdict.
-func (t *Task) writeVerdict(cid string, existing types.NameVerificationObject, row *gormdb.NameVerification) {
-	if existing == nil {
-		if err := t.db.CreateNameVerification(row); err != nil {
-			logger.Warn("Failed to create name verification", "cid", cid, "error", err)
-		}
-
-		return
-	}
-
-	if err := t.db.UpdateNameVerification(row); err != nil {
-		logger.Warn("Failed to update name verification", "cid", cid, "error", err)
-	}
-}
-
-// writeSchedule records the retry state of a transient failure. A record
-// without a row gets a pending one; an existing row keeps its verdict.
-func (t *Task) writeSchedule(cid string, existing types.NameVerificationObject, result *naming.Result, failures int, nextAttemptAt time.Time) {
+func transientStep(cid string, existing types.NameVerificationObject, result *naming.Result, now time.Time, p policy) step {
+	failures, nextAttemptAt := retrySchedule(existing, result, now, p.interval)
 	transientErr := "transient: " + result.Error
 
 	if existing == nil {
@@ -344,43 +327,81 @@ func (t *Task) writeSchedule(cid string, existing types.NameVerificationObject, 
 			NextAttemptAt:       &nextAttemptAt,
 		}
 
-		if err := t.db.CreateNameVerification(row); err != nil {
-			logger.Warn("Failed to create pending name verification", "cid", cid, "error", err)
-		}
-
-		return
+		return step{row: row, kind: outcomeTransient}
 	}
 
-	status, errMsg := scheduleStatus(existing, transientErr)
+	row := carriedRow(cid, existing, failures, nextAttemptAt)
 
-	row := &gormdb.NameVerification{
+	switch existing.GetStatus() {
+	case gormdb.VerificationStatusVerified:
+		row.Error = transientErr
+		row.Status = gormdb.VerificationStatusPending
+
+		if at := existing.GetVerifiedAt(); at != nil && now.Before(at.Add(p.ttl)) {
+			row.Status = gormdb.VerificationStatusVerified
+		}
+	case gormdb.VerificationStatusFailed:
+		row.Error = existing.GetError()
+		row.Status = gormdb.VerificationStatusFailed
+	default:
+		if !now.Before(pendingSince(existing, p.ttl).Add(pendingBudget)) {
+			row = failedRow(cid, result.Method, "verification unavailable for 24h; last: "+result.Error)
+			row.ConsecutiveFailures = failures
+			retryAt := now.Add(maxRetryDelay)
+			row.NextAttemptAt = &retryAt
+
+			return step{row: row, kind: outcomeFailed}
+		}
+
+		row.Error = transientErr
+		row.Status = gormdb.VerificationStatusPending
+	}
+
+	return step{row: row, kind: outcomeTransient}
+}
+
+// retrySchedule advances the failure counter and picks the next attempt. A
+// retry time named by the method (its circuit breaker is open) is used as is
+// and does not count as a strike. Otherwise the delay starts at half the task
+// interval, so the first retry lands on the next run, and doubles up to
+// maxRetryDelay.
+func retrySchedule(existing types.NameVerificationObject, result *naming.Result, now time.Time, interval time.Duration) (int, time.Time) {
+	failures := 0
+	if existing != nil {
+		failures = existing.GetConsecutiveFailures()
+	}
+
+	if !result.RetryAfter.IsZero() {
+		return failures, result.RetryAfter
+	}
+
+	failures++
+
+	schedule := types.ScanSchedule{RetryBase: interval / 2, RetryMax: maxRetryDelay} //nolint:mnd // half: the first retry lands on the next run
+
+	return failures, schedule.NextAttempt(now, failures)
+}
+
+// pendingSince is when a pending row stopped being served: the end of its
+// verified verdict's TTL when it has one, otherwise its creation.
+func pendingSince(existing types.NameVerificationObject, ttl time.Duration) time.Time {
+	if at := existing.GetVerifiedAt(); at != nil {
+		return at.Add(ttl)
+	}
+
+	return existing.GetCreatedAt()
+}
+
+// carriedRow starts a row from the columns a transient failure never changes.
+func carriedRow(cid string, existing types.NameVerificationObject, failures int, nextAttemptAt time.Time) *gormdb.NameVerification {
+	return &gormdb.NameVerification{
 		RecordCID:           cid,
 		Method:              existing.GetMethod(),
 		KeyID:               existing.GetKeyID(),
-		Status:              status,
-		Error:               errMsg,
 		Details:             existing.GetDetails(),
 		VerifiedAt:          existing.GetVerifiedAt(),
 		ConsecutiveFailures: failures,
 		NextAttemptAt:       &nextAttemptAt,
-	}
-
-	if err := t.db.UpdateNameVerification(row); err != nil {
-		logger.Warn("Failed to update name verification schedule", "cid", cid, "error", err)
-	}
-}
-
-// scheduleStatus keeps a verdict through a transient failure: a verified row
-// stays verified, a failed row stays failed with its own error, and any other
-// row is pending. Returns the status and the error to store.
-func scheduleStatus(existing types.NameVerificationObject, transientErr string) (string, string) {
-	switch existing.GetStatus() {
-	case gormdb.VerificationStatusVerified:
-		return gormdb.VerificationStatusVerified, transientErr
-	case gormdb.VerificationStatusFailed:
-		return gormdb.VerificationStatusFailed, existing.GetError()
-	default:
-		return gormdb.VerificationStatusPending, transientErr
 	}
 }
 
@@ -418,6 +439,8 @@ const (
 	outcomeFailed
 	outcomeTransient
 	outcomeSkipped
+	outcomeAborted
+	outcomePersistFailed
 )
 
 // outcome is what one record contributed to the run.
@@ -429,7 +452,7 @@ type outcome struct {
 
 // runSummary aggregates the outcomes of one run for the completion log line.
 type runSummary struct {
-	verified, failed, transient, skipped int
+	verified, failed, transient, skipped, aborted, persistFailed int
 
 	verifiedByMethod  map[string]int
 	failedByMethod    map[string]int
@@ -457,21 +480,23 @@ func (s *runSummary) add(o outcome) {
 	case outcomeSkipped:
 		s.skipped++
 		s.skippedByProtocol[o.protocol]++
+	case outcomeAborted:
+		s.aborted++
+	case outcomePersistFailed:
+		s.persistFailed++
 	}
 }
 
-func (s *runSummary) log() {
-	for protocol, count := range s.skippedByProtocol {
-		logger.Warn("Skipped records whose name protocol has no verification method configured",
-			"protocol", protocol,
-			"count", count)
-	}
-
+func (s *runSummary) log(duration time.Duration) {
 	logger.Info("Name verification complete",
+		"durationMs", duration.Milliseconds(),
 		"verified", s.verified,
 		"failed", s.failed,
 		"transient", s.transient,
 		"skipped", s.skipped,
+		"aborted", s.aborted,
+		"persistFailed", s.persistFailed,
 		"verifiedByMethod", s.verifiedByMethod,
-		"failedByMethod", s.failedByMethod)
+		"failedByMethod", s.failedByMethod,
+		"skippedByProtocol", s.skippedByProtocol)
 }

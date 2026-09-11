@@ -64,7 +64,14 @@ func runImport(cmd *cobra.Command) error {
 
 	if opts.Sign {
 		opts.SignFunc = func(ctx context.Context, cid string) error {
-			return signcmd.Sign(ctx, c, cid)
+			sig, err := signcmd.Sign(ctx, c, cid, cmd.ErrOrStderr())
+			if err != nil {
+				return err //nolint:wrapcheck // the importer wraps it with the record CID
+			}
+
+			signcmd.PrintCertificate(cmd, sig)
+
+			return nil
 		}
 	}
 

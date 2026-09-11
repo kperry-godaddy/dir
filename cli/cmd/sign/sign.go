@@ -10,7 +10,6 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -23,6 +22,7 @@ import (
 	"github.com/agntcy/dir/cli/presenter"
 	ctxUtils "github.com/agntcy/dir/cli/util/context"
 	"github.com/agntcy/dir/client"
+	cosignutil "github.com/agntcy/dir/client/utils/cosign"
 	"github.com/sigstore/cosign/v3/pkg/cosign"
 	"github.com/sigstore/cosign/v3/pkg/cosign/env"
 	"github.com/sigstore/sigstore/pkg/oauthflow"
@@ -51,15 +51,15 @@ certificate that belongs to the key; records named ans://... are verified
 through that certificate, and the command prints its fingerprint.
 
 Password for encrypted private keys:
-When using an encrypted private key, the password can be provided via:
-  1. COSIGN_PASSWORD environment variable
-  2. --password-stdin to explicitly read it from standard input
-  3. Interactive terminal prompt (if running in a terminal)
+The password is taken from the first of these sources that applies:
+  1. COSIGN_PASSWORD, when set; an empty value is accepted
+  2. standard input, when --password-stdin is set
+  3. an interactive terminal prompt
 
-In a non-interactive environment, standard input is read only when
---password-stdin is set. Otherwise, COSIGN_PASSWORD is used when present and an
-empty password is used when it is absent. Local and inline PEM keys must use the
-encrypted Cosign/Sigstore private-key format.
+Set COSIGN_PASSWORD to skip the prompt. A non-interactive process without
+COSIGN_PASSWORD or --password-stdin uses an empty password, which also fits
+key references that take none, such as KMS URIs. Local and inline PEM keys
+must use the encrypted Cosign/Sigstore private-key format.
 
 Usage examples:
 
@@ -88,7 +88,7 @@ Usage examples:
 
 	# Get signing result as JSON
 	dirctl sign <record-cid> --output json
-	
+
 	# Sign with key and JSON output
 	dirctl sign <record-cid> --key <key-file> --output json
 `,
@@ -108,30 +108,30 @@ Usage examples:
 }
 
 func runCommand(cmd *cobra.Command, recordCID string) error {
-	// Get the client from the context
 	c, ok := ctxUtils.GetClientFromContext(cmd.Context())
 	if !ok {
 		return errors.New("failed to get client from context")
 	}
 
-	resp, err := signRecord(cmd.Context(), c, recordCID)
+	sig, err := signRecord(cmd.Context(), c, recordCID, *opts, cmd.ErrOrStderr())
 	if err != nil {
-		return fmt.Errorf("failed to sign record: %w", err)
+		return err
 	}
 
-	return printSignResult(cmd, resp.GetSignature(), time.Now())
+	return printSignResult(cmd, sig)
 }
 
-// Sign signs the record with the configured signing options. "dirctl push
-// --sign" and "dirctl import --sign" share it and report success themselves.
-func Sign(ctx context.Context, c *client.Client, recordCID string) error {
-	_, err := signRecord(ctx, c, recordCID)
-
-	return err
+// Sign signs the record with the flag-bound signing options and returns the
+// stored signature. Warnings a user should see before signing, such as an
+// attached certificate outside its validity period, go to stderr. "dirctl
+// push --sign" and "dirctl import --sign" call it and report the certificate
+// with PrintCertificate.
+func Sign(ctx context.Context, c *client.Client, recordCID string, stderr io.Writer) (*signv1.Signature, error) {
+	return signRecord(ctx, c, recordCID, *opts, stderr)
 }
 
-func signRecord(ctx context.Context, c *client.Client, recordCID string) (*signv1.SignResponse, error) {
-	provider, err := signProvider(*opts)
+func signRecord(ctx context.Context, c *client.Client, recordCID string, o Options, stderr io.Writer) (*signv1.Signature, error) {
+	provider, err := signProvider(o, stderr)
 	if err != nil {
 		return nil, err
 	}
@@ -141,22 +141,25 @@ func signRecord(ctx context.Context, c *client.Client, recordCID string) (*signv
 		Provider:  provider,
 	})
 	if err != nil {
-		if opts.Key != "" {
-			err = formatPrivateKeyError(err)
+		if o.Key != "" {
+			return nil, formatPrivateKeyError(err)
 		}
 
-		return nil, fmt.Errorf("failed to sign record: %w", err)
+		return nil, err
 	}
 
-	return resp, nil
+	return resp.GetSignature(), nil
 }
 
 // signProvider builds the signing request for the configured options: a key
 // reference, a pre-issued OIDC token, or an interactive OIDC login.
-func signProvider(o Options) (*signv1.SignRequestProvider, error) {
+func signProvider(o Options, stderr io.Writer) (*signv1.SignRequestProvider, error) {
 	switch {
+	case o.Certificate != "" && o.Key == "":
+		return nil, errors.New("--certificate requires --key: a certificate can only be attached to a key-based signature")
+
 	case o.Key != "":
-		return keyProvider(o)
+		return keyProvider(o, stderr)
 
 	case o.OIDCToken != "":
 		return oidcProvider(o, o.OIDCToken), nil
@@ -174,13 +177,13 @@ func signProvider(o Options) (*signv1.SignRequestProvider, error) {
 // keyProvider builds a key-based signing request. The key can be a file path,
 // URL, KMS URI, etc.; the certificate is resolved before the password is read
 // so a bad --certificate fails without prompting.
-func keyProvider(o Options) (*signv1.SignRequestProvider, error) {
-	certificate, err := resolveCertificate(o)
+func keyProvider(o Options, stderr io.Writer) (*signv1.SignRequestProvider, error) {
+	certificate, err := resolveCertificate(o, time.Now(), stderr)
 	if err != nil {
 		return nil, err
 	}
 
-	pw, err := readPrivateKeyPassword()()
+	pw, err := readPrivateKeyPassword(o.PasswordStdin)()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read password: %w", err)
 	}
@@ -217,16 +220,12 @@ func oidcProvider(o Options, token string) *signv1.SignRequestProvider {
 	}
 }
 
-// resolveCertificate reads the --certificate PEM file. It returns "" when no
-// certificate was requested. The file is read here because the request carries
-// the certificate inline and, unlike the private key, it is public material.
-func resolveCertificate(o Options) (string, error) {
+// resolveCertificate reads the --certificate PEM bundle and returns it, or ""
+// when none was requested. Certificates outside their validity period at now
+// are reported on stderr before any signing or password prompt.
+func resolveCertificate(o Options, now time.Time, stderr io.Writer) (string, error) {
 	if o.Certificate == "" {
 		return "", nil
-	}
-
-	if o.Key == "" {
-		return "", errors.New("--certificate requires --key: a certificate can only be attached to a key-based signature")
 	}
 
 	data, err := os.ReadFile(o.Certificate) //nolint:gosec // operator-supplied path from a flag
@@ -234,26 +233,18 @@ func resolveCertificate(o Options) (string, error) {
 		return "", fmt.Errorf("reading certificate file: %w", err)
 	}
 
-	if !containsCertificateBlock(data) {
-		return "", fmt.Errorf("certificate file %q contains no CERTIFICATE PEM block", o.Certificate)
+	certs, err := cosignutil.ParseCertificateBundle(data)
+	if err != nil {
+		return "", fmt.Errorf("certificate file %q: %w", o.Certificate, err)
+	}
+
+	for _, cert := range certs {
+		if warning := certificateValidityWarning(cert, now); warning != "" {
+			warn(stderr, warning)
+		}
 	}
 
 	return string(data), nil
-}
-
-func containsCertificateBlock(data []byte) bool {
-	for rest := data; ; {
-		var block *pem.Block
-
-		block, rest = pem.Decode(rest)
-		if block == nil {
-			return false
-		}
-
-		if block.Type == "CERTIFICATE" {
-			return true
-		}
-	}
 }
 
 // signOutcome is printed when a certificate was attached to a key-based
@@ -267,28 +258,50 @@ func (o signOutcome) String() string {
 	return "signed (certificate " + o.CertificateFingerprint + ")"
 }
 
-// printSignResult reports the signature. Key-based signatures that carry a
-// certificate also report its fingerprint, and a certificate outside its
-// validity period is warned about on stderr. OIDC signatures keep the plain
-// "signed" output; their Fulcio certificate is not the user's to track.
-func printSignResult(cmd *cobra.Command, sig *signv1.Signature, now time.Time) error {
-	if sig.GetContentBundle() != "" || sig.GetCertificate() == "" {
+// printSignResult reports the stored signature. A key-based signature with a
+// certificate also reports the certificate's fingerprint.
+func printSignResult(cmd *cobra.Command, sig *signv1.Signature) error {
+	cert, ok := attachedCertificate(sig, cmd.ErrOrStderr())
+	if !ok {
 		return presenter.PrintMessage(cmd, "signature", "Record is", "signed")
-	}
-
-	cert, err := decodeCertificate(sig.GetCertificate())
-	if err != nil {
-		return fmt.Errorf("decoding attached certificate: %w", err)
-	}
-
-	if warning := certificateValidityWarning(cert, now); warning != "" {
-		presenter.Errorf(cmd, "Warning: %s\n", warning)
 	}
 
 	return presenter.PrintMessage(cmd, "signature", "Record is", signOutcome{
 		Signed:                 true,
 		CertificateFingerprint: certificateFingerprint(cert),
 	})
+}
+
+// PrintCertificate reports the certificate attached to a key-based signature
+// for commands whose own result owns stdout: human output gets a line, the
+// structured formats get it on stderr. A signature without a certificate
+// prints nothing.
+func PrintCertificate(cmd *cobra.Command, sig *signv1.Signature) {
+	cert, ok := attachedCertificate(sig, cmd.ErrOrStderr())
+	if !ok {
+		return
+	}
+
+	presenter.PrintSmartf(cmd, "Signed with certificate %s\n", certificateFingerprint(cert))
+}
+
+// attachedCertificate decodes the certificate of a key-based signature. One
+// that cannot be decoded is reported as a warning rather than an error: the
+// signature is already stored, so the command has done its work.
+func attachedCertificate(sig *signv1.Signature, stderr io.Writer) (*x509.Certificate, bool) {
+	encoded, ok := sig.KeyCertificate()
+	if !ok {
+		return nil, false
+	}
+
+	cert, err := decodeCertificate(encoded)
+	if err != nil {
+		warn(stderr, fmt.Sprintf("the stored signature carries a certificate this dirctl cannot decode: %v", err))
+
+		return nil, false
+	}
+
+	return cert, true
 }
 
 func decodeCertificate(encoded string) (*x509.Certificate, error) {
@@ -314,16 +327,20 @@ func certificateFingerprint(cert *x509.Certificate) string {
 func certificateValidityWarning(cert *x509.Certificate, now time.Time) string {
 	switch {
 	case now.Before(cert.NotBefore):
-		return fmt.Sprintf("certificate %s is not valid before %s; name verification will fail until then",
+		return fmt.Sprintf("certificate %s is not valid before %s; a record signed with it fails name verification until then",
 			certificateFingerprint(cert), cert.NotBefore.UTC().Format(time.RFC3339))
 
 	case now.After(cert.NotAfter):
-		return fmt.Sprintf("certificate %s expired at %s; renew it and re-sign the record or name verification will fail",
+		return fmt.Sprintf("certificate %s expired at %s; a record signed with it fails name verification until the certificate is renewed and the record re-signed",
 			certificateFingerprint(cert), cert.NotAfter.UTC().Format(time.RFC3339))
 
 	default:
 		return ""
 	}
+}
+
+func warn(w io.Writer, message string) {
+	_, _ = fmt.Fprintln(w, "Warning:", message)
 }
 
 func formatPrivateKeyError(err error) error {
@@ -341,7 +358,7 @@ func formatPrivateKeyError(err error) error {
 
 	if strings.Contains(err.Error(), "decrypt:") { //nolint:errorlint // cosign exposes no typed/sentinel error
 		return fmt.Errorf(
-			"failed to decrypt private key: set COSIGN_PASSWORD or use --password-stdin: %w",
+			"failed to decrypt private key: the password is wrong or missing; set COSIGN_PASSWORD or use --password-stdin: %w",
 			err,
 		)
 	}
@@ -375,12 +392,12 @@ func (r privateKeyPasswordReader) read() ([]byte, error) {
 	}
 }
 
-func readPrivateKeyPassword() func() ([]byte, error) {
+func readPrivateKeyPassword(passwordStdin bool) func() ([]byte, error) {
 	return privateKeyPasswordReader{
 		lookupPassword: func() (string, bool) {
 			return env.LookupEnv(env.VariablePassword)
 		},
-		passwordStdin: opts.PasswordStdin,
+		passwordStdin: passwordStdin,
 		stdin:         os.Stdin,
 		isTerminal:    cosign.IsTerminal,
 		readTerminal:  cosign.GetPassFromTerm,

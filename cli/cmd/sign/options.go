@@ -30,23 +30,12 @@ type Options struct {
 
 func AddSigningFlags(flags *pflag.FlagSet) {
 	flags.StringVar(&opts.Key, "key", "",
-		`Private key for signing. Keys held in a KMS need no export; pass the
-provider URI and configure its credentials:
-  - AWS KMS: awskms://[ENDPOINT]/[ID/ALIAS/ARN]
-  - GCP KMS: gcpkms://projects/[PROJECT]/locations/[LOC]/keyRings/[RING]/cryptoKeys/[KEY]
-  - Azure Key Vault: azurekms://[VAULT_NAME][VAULT_URI]/[KEY]
-  - Hashicorp Vault: hashivault://[KEY]
-  - PKCS11 token: pkcs11:token=...;slot-id=...;object=...
-File and inline PEM keys must use the encrypted Cosign/Sigstore format:
-wrap an existing key with "cosign import-key-pair --key <key.pem>" or
-generate one with "cosign generate-key-pair", and set a non-empty
-COSIGN_PASSWORD for both the cosign command and dirctl sign.
-Other accepted references:
-  - File path: /path/to/cosign.key
-  - HTTP(S) URL: https://example.com/cosign.key
-  - Environment variable: env://COSIGN_PRIVATE_KEY
-  - Kubernetes secret: k8s://[NAMESPACE]/[SECRET_NAME]
-  - GitLab: gitlab://[PROJECT]`)
+		`Private key for signing: a KMS URI (awskms://, gcpkms://, azurekms://,
+hashivault://, pkcs11:), a file path, an HTTP(S) URL, env://VAR, k8s://NAMESPACE/SECRET
+or gitlab://PROJECT. File and inline PEM keys must use the encrypted Cosign/Sigstore
+format: wrap an existing key with "cosign import-key-pair --key <key.pem>" or
+generate one with "cosign generate-key-pair". Set COSIGN_PASSWORD to skip the
+password prompt.`)
 	flags.StringVar(&opts.Certificate, "certificate", "",
 		`PEM file with the X.509 certificate, or chain, for --key. Only the
 certificate whose public key matches the signing key is attached to the

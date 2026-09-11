@@ -35,6 +35,7 @@ const (
 	dnsTimeoutText   = "ans dns: lookup timed out"
 	taskTestTTL      = 7 * 24 * time.Hour
 	taskTestInterval = time.Hour
+	ansProtocol      = "ans://"
 )
 
 var (
@@ -199,13 +200,13 @@ func newTestTask(t *testing.T, cfg Config, db *fakeDB, fetcher *fakeFetcher, pro
 }
 
 func ansProvider(lookup *fakeLookup) *naming.Provider {
-	return naming.NewProvider(naming.WithLookup(naming.ANSProtocol, lookup))
+	return naming.NewProvider(naming.WithLookup(ansProtocol, lookup))
 }
 
 func publishedKey(t *testing.T, id testIdentity) naming.PublicKey {
 	t.Helper()
 
-	return naming.PublicKey{ID: victimKeyID, Type: "ecdsa-p256", Key: mustMarshalKey(t, &id.key.PublicKey)}
+	return naming.PublicKey{ID: victimKeyID, Type: "ecdsa-p256", Key: mustMarshalKey(t, id.key.Public())}
 }
 
 func ansRecords() []coretypes.Record {
@@ -347,7 +348,53 @@ func TestTask_Run_ANSCertificateSignersAreBound(t *testing.T) {
 	assert.Equal(t, "agent.example.com", lookup.name.Domain)
 	assert.Equal(t, "v1.0.0", lookup.name.Version)
 	assert.Equal(t, 1, fetcher.sigCalls)
-	assert.Equal(t, 0, fetcher.keyCalls, "the ans lane never consults public-key referrers")
+	assert.Equal(t, 1, fetcher.keyCalls)
+}
+
+// Every name gets both signer kinds: the certificates bound to the record's
+// signatures and the public keys attached to it.
+func TestTask_Run_BothSignerKindsReachTheMethod(t *testing.T) {
+	certified := newTestIdentity(t, signersTestSAN)
+	keyed := newTestIdentity(t, "")
+
+	certifiedKey := publishedKey(t, certified)
+	keyedKey := naming.PublicKey{ID: "SHA256:keyed", Type: "ecdsa-p256", Key: mustMarshalKey(t, keyed.key.Public())}
+
+	tests := []struct {
+		name      string
+		record    string
+		published naming.PublicKey
+		wantKeyID string
+	}{
+		{name: "ans name verified through a public-key signer", record: taskTestANSName, published: keyedKey, wantKeyID: "SHA256:keyed"},
+		{name: "ans name verified through a certificate-bound signer", record: taskTestANSName, published: certifiedKey, wantKeyID: victimKeyID},
+		{name: "https name verified through a public-key signer", record: taskTestHTTPS, published: keyedKey, wantKeyID: "SHA256:keyed"},
+		{name: "https name verified through a certificate-bound signer", record: taskTestHTTPS, published: certifiedKey, wantKeyID: victimKeyID},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ans := &fakeLookup{keys: []naming.PublicKey{tc.published}}
+			wellKnown := &fakeKeyLookup{keys: []naming.PublicKey{tc.published}}
+			provider := naming.NewProvider(naming.WithLookup(ansProtocol, ans), naming.WithWellKnownLookup(wellKnown))
+
+			fetcher := &fakeFetcher{
+				signatures: []*signv1.Signature{signedBy(t, certified)},
+				publicKeys: []string{base64.StdEncoding.EncodeToString(keyedKey.Key)},
+			}
+			db := &fakeDB{records: []coretypes.Record{&fakeRecord{cid: taskTestCID, name: tc.record}}}
+
+			task := newTestTask(t, Config{Enabled: true}, db, fetcher, provider)
+			require.NoError(t, task.Run(t.Context()))
+
+			require.Len(t, db.created, 1)
+			assert.Equal(t, gormdb.VerificationStatusVerified, db.created[0].GetStatus())
+			assert.Equal(t, tc.wantKeyID, db.created[0].GetKeyID())
+			assert.Equal(t, 1, fetcher.sigCalls)
+			assert.Equal(t, 1, fetcher.keyCalls)
+			assert.Equal(t, 1, ans.calls+wellKnown.calls, "exactly one Verify per record")
+		})
+	}
 }
 
 func TestTask_Run_ANSCopiedCertificateIsNotVerified(t *testing.T) {
@@ -380,7 +427,7 @@ func TestTask_Run_ANSOneLookupForManySigners(t *testing.T) {
 	require.NoError(t, task.Run(t.Context()))
 
 	assert.Equal(t, 1, lookup.calls)
-	assert.Equal(t, [][]byte{victim.cert.Raw, other.cert.Raw}, lookup.evidence.Certificates, "the certificate naming the host is offered first")
+	assert.Equal(t, [][]byte{other.cert.Raw, victim.cert.Raw}, lookup.evidence.Certificates, "certificates are offered in signature order")
 	require.Len(t, db.created, 1)
 	assert.Equal(t, gormdb.VerificationStatusVerified, db.created[0].GetStatus())
 }
@@ -416,23 +463,36 @@ func TestTask_Run_UnparsableNameIsTerminal(t *testing.T) {
 // pending with a fixed message, retried on the next run, and the cause stays
 // in the log.
 func TestTask_Run_FetcherErrorIsTransientWithFixedText(t *testing.T) {
-	lookup := &fakeLookup{}
-	db := &fakeDB{records: ansRecords()}
-	fetcher := &fakeFetcher{sigErr: errors.New("registry unavailable: dial tcp 10.0.0.1:5000")}
+	registryErr := errors.New("registry unavailable: dial tcp 10.0.0.1:5000")
 
-	task := newTestTask(t, Config{Enabled: true, Interval: taskTestInterval}, db, fetcher, ansProvider(lookup))
-	require.NoError(t, task.Run(t.Context()))
+	tests := []struct {
+		name    string
+		fetcher *fakeFetcher
+	}{
+		{name: "signatures cannot be pulled", fetcher: &fakeFetcher{sigErr: registryErr}},
+		{name: "public keys cannot be pulled", fetcher: &fakeFetcher{keyErr: registryErr}},
+	}
 
-	require.Len(t, db.created, 1)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			lookup := &fakeLookup{}
+			db := &fakeDB{records: ansRecords()}
 
-	row := db.created[0]
-	assert.Equal(t, gormdb.VerificationStatusPending, row.GetStatus())
-	assert.Equal(t, string(naming.MethodANS), row.GetMethod())
-	assert.Equal(t, "transient: "+unreadableSignaturesMessage, row.GetError())
-	assert.NotContains(t, row.GetError(), "10.0.0.1")
-	assert.Equal(t, 1, row.GetConsecutiveFailures())
-	assert.Equal(t, at(taskTestInterval/2), row.GetNextAttemptAt())
-	assert.Equal(t, 0, lookup.calls)
+			task := newTestTask(t, Config{Enabled: true, Interval: taskTestInterval}, db, tc.fetcher, ansProvider(lookup))
+			require.NoError(t, task.Run(t.Context()))
+
+			require.Len(t, db.created, 1)
+
+			row := db.created[0]
+			assert.Equal(t, gormdb.VerificationStatusPending, row.GetStatus())
+			assert.Equal(t, string(naming.MethodANS), row.GetMethod())
+			assert.Equal(t, "transient: "+unreadableSignaturesMessage, row.GetError())
+			assert.NotContains(t, row.GetError(), "10.0.0.1")
+			assert.Equal(t, 1, row.GetConsecutiveFailures())
+			assert.Equal(t, at(taskTestInterval/2), row.GetNextAttemptAt())
+			assert.Equal(t, 0, lookup.calls)
+		})
+	}
 }
 
 // --- jwks lane ---
@@ -441,10 +501,10 @@ func TestTask_Run_HTTPSUsesPublicKeys(t *testing.T) {
 	pemIdentity := newTestIdentity(t, "")
 	derIdentity := newTestIdentity(t, "")
 
-	pemKey, err := cryptoutils.MarshalPublicKeyToPEM(&pemIdentity.key.PublicKey)
+	pemKey, err := cryptoutils.MarshalPublicKeyToPEM(pemIdentity.key.Public())
 	require.NoError(t, err)
 
-	derKey := mustMarshalKey(t, &derIdentity.key.PublicKey)
+	derKey := mustMarshalKey(t, derIdentity.key.Public())
 
 	wellKnown := &fakeKeyLookup{keys: []naming.PublicKey{{ID: "kid-der", Type: "ecdsa-p256", Key: derKey}}}
 	fetcher := &fakeFetcher{publicKeys: []string{string(pemKey), base64.StdEncoding.EncodeToString(derKey), "not a key", ""}}
@@ -465,7 +525,7 @@ func TestTask_Run_HTTPSUsesPublicKeys(t *testing.T) {
 	assert.Equal(t, "example.com", wellKnown.domain)
 	assert.Equal(t, "https", wellKnown.scheme)
 	assert.Equal(t, 1, fetcher.keyCalls)
-	assert.Equal(t, 0, fetcher.sigCalls, "the jwks lane never pulls signatures")
+	assert.Equal(t, 1, fetcher.sigCalls)
 }
 
 func TestTask_Run_HTTPSWithoutPublicKeysIsTerminal(t *testing.T) {
@@ -484,9 +544,9 @@ func TestTask_Run_HTTPSWithoutPublicKeysIsTerminal(t *testing.T) {
 
 func TestPublicKeyDER(t *testing.T) {
 	id := newTestIdentity(t, "")
-	der := mustMarshalKey(t, &id.key.PublicKey)
+	der := mustMarshalKey(t, id.key.Public())
 
-	pemKey, err := cryptoutils.MarshalPublicKeyToPEM(&id.key.PublicKey)
+	pemKey, err := cryptoutils.MarshalPublicKeyToPEM(id.key.Public())
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -497,6 +557,7 @@ func TestPublicKeyDER(t *testing.T) {
 	}{
 		{name: "pem", key: string(pemKey), want: der},
 		{name: "base64 der", key: base64.StdEncoding.EncodeToString(der), want: der},
+		{name: "base64 that is not a public key", key: base64.StdEncoding.EncodeToString([]byte("not a key")), wantErr: true},
 		{name: "empty", key: "", wantErr: true},
 		{name: "neither", key: "not a key!", wantErr: true},
 	}
@@ -891,6 +952,25 @@ func TestTask_Run_CancellationDuringARecordWritesNothing(t *testing.T) {
 	assert.Equal(t, 1, lookup.calls)
 }
 
+// A run canceled while the record's signatures are being read reports the
+// interruption, not the record.
+func TestTask_VerifyRecord_CancellationWhileCollectingSignersWritesNothing(t *testing.T) {
+	victim := newTestIdentity(t, signersTestSAN)
+	db := &fakeDB{}
+	lookup := &fakeLookup{}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	task := newTestTask(t, Config{Enabled: true}, db, &fakeFetcher{signatures: []*signv1.Signature{signedBy(t, victim)}}, ansProvider(lookup))
+
+	got := task.verifyRecord(ctx, taskTestCID, taskTestANSName)
+
+	assert.Equal(t, outcomeAborted, got.kind)
+	assert.Equal(t, 0, db.writes())
+	assert.Equal(t, 0, lookup.calls)
+}
+
 func TestTask_VerifyRecord_SuccessAfterCancellationIsStored(t *testing.T) {
 	victim := newTestIdentity(t, signersTestSAN)
 
@@ -916,8 +996,8 @@ func TestRunSummary(t *testing.T) {
 	summary.add(outcome{kind: outcomeVerified, method: "wellknown"})
 	summary.add(outcome{kind: outcomeFailed, method: "ans"})
 	summary.add(outcome{kind: outcomeTransient, method: "ans"})
-	summary.add(outcome{kind: outcomeSkipped, protocol: naming.ANSProtocol})
-	summary.add(outcome{kind: outcomeSkipped, protocol: naming.ANSProtocol})
+	summary.add(outcome{kind: outcomeSkipped, protocol: ansProtocol})
+	summary.add(outcome{kind: outcomeSkipped, protocol: ansProtocol})
 	summary.add(outcome{kind: outcomeAborted, method: "ans"})
 	summary.add(outcome{kind: outcomePersistFailed, method: "ans"})
 
@@ -929,7 +1009,7 @@ func TestRunSummary(t *testing.T) {
 	assert.Equal(t, 1, summary.persistFailed)
 	assert.Equal(t, map[string]int{"ans": 1, "wellknown": 1}, summary.verifiedByMethod)
 	assert.Equal(t, map[string]int{"ans": 1}, summary.failedByMethod)
-	assert.Equal(t, map[string]int{naming.ANSProtocol: 2}, summary.skippedByProtocol)
+	assert.Equal(t, map[string]int{ansProtocol: 2}, summary.skippedByProtocol)
 
 	summary.log(time.Second)
 }
@@ -944,13 +1024,13 @@ func TestCertificateSigners_MatchesClientPayloadShape(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEmpty(t, raw)
 
-	signers, err := certificateSigners(t.Context(), taskTestCID, "agent.example.com", []*signv1.Signature{sig})
+	signers, err := certificateSigners(t.Context(), taskTestCID, []*signv1.Signature{sig})
 	require.NoError(t, err)
 	require.Len(t, signers, 1)
 
 	parsed, err := x509.ParsePKIXPublicKey(signers[0].Key)
 	require.NoError(t, err)
-	assert.Equal(t, &victim.key.PublicKey, parsed)
+	assert.Equal(t, victim.key.Public(), parsed)
 }
 
 func TestFailedRow_DefaultMessage(t *testing.T) {

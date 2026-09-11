@@ -9,6 +9,7 @@ package name
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -133,7 +134,7 @@ func (t *Task) verifyRecord(ctx context.Context, cid, recordName string) outcome
 	recordCtx, cancel := context.WithTimeout(ctx, t.config.GetRecordTimeout())
 	defer cancel()
 
-	signers, err := t.collectSigners(recordCtx, cid, parsed)
+	signers, err := t.collectSigners(recordCtx, cid)
 	if err != nil {
 		logger.Warn("Could not read the record's signatures", "cid", cid, "recordName", recordName, "error", err)
 
@@ -145,19 +146,19 @@ func (t *Task) verifyRecord(ctx context.Context, cid, recordName string) outcome
 	return t.recordResult(ctx, cid, recordName, t.provider.Verify(recordCtx, recordName, signers), started)
 }
 
-// collectSigners gathers the parties that signed the record. For ans:// names
-// a signer is a certificate whose key verifiably produced a signature over the
-// CID; for other names it is a public key attached to the record.
-func (t *Task) collectSigners(ctx context.Context, cid string, parsed *naming.ParsedName) ([]naming.Signer, error) {
+// collectSigners gathers the parties that signed the record: the certificates
+// bound to its signatures, then the public keys attached to it.
+func (t *Task) collectSigners(ctx context.Context, cid string) ([]naming.Signer, error) {
 	ref := &corev1.RecordRef{Cid: cid}
 
-	if parsed.Protocol == naming.ANSProtocol {
-		sigs, err := t.fetcher.PullSignatures(ctx, ref)
-		if err != nil {
-			return nil, fmt.Errorf("pull signatures: %w", err)
-		}
+	sigs, err := t.fetcher.PullSignatures(ctx, ref)
+	if err != nil {
+		return nil, fmt.Errorf("pull signatures: %w", err)
+	}
 
-		return certificateSigners(ctx, cid, parsed.Domain, sigs)
+	signers, err := certificateSigners(ctx, cid, sigs)
+	if err != nil {
+		return nil, err
 	}
 
 	keys, err := t.fetcher.PullPublicKeys(ctx, ref)
@@ -165,7 +166,7 @@ func (t *Task) collectSigners(ctx context.Context, cid string, parsed *naming.Pa
 		return nil, fmt.Errorf("pull public keys: %w", err)
 	}
 
-	return publicKeySigners(cid, keys), nil
+	return append(signers, publicKeySigners(cid, keys)...), nil
 }
 
 // publicKeySigners decodes the record's public keys, PEM or base64 DER, into
@@ -198,6 +199,10 @@ func publicKeyDER(key string) ([]byte, error) {
 		der, decodeErr := base64.StdEncoding.DecodeString(key)
 		if decodeErr != nil {
 			return nil, fmt.Errorf("public key is neither PEM nor base64 DER: %w", err)
+		}
+
+		if _, parseErr := x509.ParsePKIXPublicKey(der); parseErr != nil {
+			return nil, fmt.Errorf("public key is not DER SubjectPublicKeyInfo: %w", parseErr)
 		}
 
 		return der, nil

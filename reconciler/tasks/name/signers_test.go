@@ -4,10 +4,14 @@
 package name
 
 import (
+	"bytes"
 	"context"
+	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -19,27 +23,33 @@ import (
 	"time"
 
 	signv1 "github.com/agntcy/dir/api/sign/v1"
+	"github.com/sigstore/sigstore/pkg/signature"
+	"github.com/sigstore/sigstore/pkg/signature/options"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 const (
-	signersTestCID  = "baeareitestsigners000000000000000000000000000000000000000000000"
-	signersTestHost = "agent.example.com"
-	signersTestSAN  = "ans://v1.0.0.agent.example.com"
+	signersTestCID = "baeareitestsigners000000000000000000000000000000000000000000000"
+	signersTestSAN = "ans://v1.0.0.agent.example.com"
+	rsaTestBits    = 2048
 )
 
-// testIdentity is a key with a self-signed certificate naming an ANS URI.
+// testIdentity is a key with a self-signed certificate, optionally naming an
+// ANS URI.
 type testIdentity struct {
-	key  *ecdsa.PrivateKey
+	key  crypto.Signer
 	cert *x509.Certificate
 }
 
 func newTestIdentity(t *testing.T, uriSAN string) testIdentity {
 	t.Helper()
 
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
+	return newTestIdentityWithKey(t, newECDSAKey(t, elliptic.P256()), uriSAN)
+}
+
+func newTestIdentityWithKey(t *testing.T, key crypto.Signer, uriSAN string) testIdentity {
+	t.Helper()
 
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
@@ -56,7 +66,7 @@ func newTestIdentity(t *testing.T, uriSAN string) testIdentity {
 		template.URIs = []*url.URL{uri}
 	}
 
-	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	der, err := x509.CreateCertificate(rand.Reader, template, template, key.Public(), key)
 	require.NoError(t, err)
 
 	cert, err := x509.ParseCertificate(der)
@@ -65,17 +75,59 @@ func newTestIdentity(t *testing.T, uriSAN string) testIdentity {
 	return testIdentity{key: key, cert: cert}
 }
 
-// signCID produces what cosign's key signer produces for the test record: an
-// ASN.1 DER ECDSA signature over SHA-256 of the CID, base64-encoded.
-func signCID(t *testing.T, key *ecdsa.PrivateKey) string {
+func newECDSAKey(t *testing.T, curve elliptic.Curve) crypto.Signer {
 	t.Helper()
 
-	digest := sha256.Sum256([]byte(signersTestCID))
+	key, err := ecdsa.GenerateKey(curve, rand.Reader)
+	require.NoError(t, err)
 
-	sig, err := ecdsa.SignASN1(rand.Reader, key, digest[:])
+	return key
+}
+
+func ecdsaKey(curve elliptic.Curve) func(t *testing.T) crypto.Signer {
+	return func(t *testing.T) crypto.Signer {
+		t.Helper()
+
+		return newECDSAKey(t, curve)
+	}
+}
+
+func newEd25519Key(t *testing.T) crypto.Signer {
+	t.Helper()
+
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	return key
+}
+
+func newRSAKey(t *testing.T) crypto.Signer {
+	t.Helper()
+
+	key, err := rsa.GenerateKey(rand.Reader, rsaTestBits)
+	require.NoError(t, err)
+
+	return key
+}
+
+// signPayload produces what the registry's key signer produces: the payload
+// signed through sigstore's default signer for the key type, base64-encoded.
+func signPayload(t *testing.T, key crypto.Signer, payload string) string {
+	t.Helper()
+
+	sv, err := signature.LoadDefaultSignerVerifier(key, options.WithED25519ph())
+	require.NoError(t, err)
+
+	sig, err := sv.SignMessage(bytes.NewReader([]byte(payload)))
 	require.NoError(t, err)
 
 	return base64.StdEncoding.EncodeToString(sig)
+}
+
+func signCID(t *testing.T, key crypto.Signer) string {
+	t.Helper()
+
+	return signPayload(t, key, signersTestCID)
 }
 
 func encodeCert(cert *x509.Certificate) string {
@@ -89,7 +141,6 @@ func signedBy(t *testing.T, id testIdentity) *signv1.Signature {
 	return &signv1.Signature{
 		Signature:   signCID(t, id.key),
 		Certificate: encodeCert(id.cert),
-		Algorithm:   "ecdsa-p256",
 	}
 }
 
@@ -103,16 +154,64 @@ func randomSignature(t *testing.T) string {
 	return base64.StdEncoding.EncodeToString(junk)
 }
 
+func mustMarshalKey(t *testing.T, key crypto.PublicKey) []byte {
+	t.Helper()
+
+	der, err := x509.MarshalPKIXPublicKey(key)
+	require.NoError(t, err)
+
+	return der
+}
+
+// junkSignatures are copies of the identity's certificate with random
+// signature bytes.
+func junkSignatures(t *testing.T, id testIdentity, count int) []*signv1.Signature {
+	t.Helper()
+
+	sigs := make([]*signv1.Signature, 0, count)
+	for range count {
+		sigs = append(sigs, &signv1.Signature{Signature: randomSignature(t), Certificate: encodeCert(id.cert)})
+	}
+
+	return sigs
+}
+
+// A signature made through the registry's signer binds its certificate for
+// every key type the signer supports.
+func TestCertificateSigners_BindsEverySignerKeyType(t *testing.T) {
+	tests := []struct {
+		name string
+		key  func(t *testing.T) crypto.Signer
+	}{
+		{name: "ecdsa p-256", key: ecdsaKey(elliptic.P256())},
+		{name: "ecdsa p-384", key: ecdsaKey(elliptic.P384())},
+		{name: "ecdsa p-521", key: ecdsaKey(elliptic.P521())},
+		{name: "ed25519", key: newEd25519Key},
+		{name: "rsa 2048", key: newRSAKey},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			id := newTestIdentityWithKey(t, tc.key(t), signersTestSAN)
+
+			signers, err := certificateSigners(t.Context(), signersTestCID, []*signv1.Signature{signedBy(t, id)})
+			require.NoError(t, err)
+
+			require.Len(t, signers, 1)
+			assert.Equal(t, mustMarshalKey(t, id.key.Public()), signers[0].Key)
+			assert.Equal(t, id.cert.Raw, signers[0].Certificate)
+		})
+	}
+}
+
 func TestCertificateSigners(t *testing.T) {
 	victim := newTestIdentity(t, signersTestSAN)
 	attacker := newTestIdentity(t, "")
 	impostor := newTestIdentity(t, signersTestSAN)
 
-	victimKey, err := x509.MarshalPKIXPublicKey(&victim.key.PublicKey)
-	require.NoError(t, err)
-
-	impostorKey, err := x509.MarshalPKIXPublicKey(&impostor.key.PublicKey)
-	require.NoError(t, err)
+	victimKey := mustMarshalKey(t, victim.key.Public())
+	attackerKey := mustMarshalKey(t, attacker.key.Public())
+	impostorKey := mustMarshalKey(t, impostor.key.Public())
 
 	tests := []struct {
 		name      string
@@ -129,6 +228,14 @@ func TestCertificateSigners(t *testing.T) {
 			},
 			wantKeys:  [][]byte{victimKey},
 			wantCerts: [][]byte{victim.cert.Raw},
+		},
+		{
+			name: "valid signature replayed from another record yields nothing",
+			sigs: func(t *testing.T) []*signv1.Signature {
+				t.Helper()
+
+				return []*signv1.Signature{{Signature: signPayload(t, victim.key, taskTestOtherCID), Certificate: encodeCert(victim.cert)}}
+			},
 		},
 		{
 			name: "copied victim certificate with random signature bytes yields nothing",
@@ -157,22 +264,35 @@ func TestCertificateSigners(t *testing.T) {
 			wantCerts: [][]byte{impostor.cert.Raw},
 		},
 		{
-			name: "forty junk signers plus one real yield exactly the real one",
+			name: "forty junk signatures plus one real yield exactly the real one",
 			sigs: func(t *testing.T) []*signv1.Signature {
 				t.Helper()
 
-				sigs := make([]*signv1.Signature, 0, 41)
-				for range 40 {
-					sigs = append(sigs, &signv1.Signature{Signature: randomSignature(t), Certificate: encodeCert(victim.cert)})
-				}
-
-				return append(sigs, signedBy(t, victim))
+				return append(junkSignatures(t, victim, 40), signedBy(t, victim))
 			},
 			wantKeys:  [][]byte{victimKey},
 			wantCerts: [][]byte{victim.cert.Raw},
 		},
 		{
-			name: "oidc signature with a content bundle is skipped",
+			name: "real signature within the examined cap is found behind junk",
+			sigs: func(t *testing.T) []*signv1.Signature {
+				t.Helper()
+
+				return append(junkSignatures(t, victim, maxSignaturesExamined-1), signedBy(t, victim))
+			},
+			wantKeys:  [][]byte{victimKey},
+			wantCerts: [][]byte{victim.cert.Raw},
+		},
+		{
+			name: "three hundred junk signatures ahead of the real one hit the cap and leave it unexamined",
+			sigs: func(t *testing.T) []*signv1.Signature {
+				t.Helper()
+
+				return append(junkSignatures(t, victim, 300), signedBy(t, victim))
+			},
+		},
+		{
+			name: "keyless signature with a content bundle is skipped",
 			sigs: func(t *testing.T) []*signv1.Signature {
 				t.Helper()
 
@@ -189,6 +309,17 @@ func TestCertificateSigners(t *testing.T) {
 
 				sig := signedBy(t, victim)
 				sig.Certificate = strings.Repeat("A", maxEncodedCertificateSize+4)
+
+				return []*signv1.Signature{sig}
+			},
+		},
+		{
+			name: "oversize signature is skipped before decoding",
+			sigs: func(t *testing.T) []*signv1.Signature {
+				t.Helper()
+
+				sig := signedBy(t, victim)
+				sig.Signature = strings.Repeat("A", maxEncodedSignatureSize+4)
 
 				return []*signv1.Signature{sig}
 			},
@@ -236,20 +367,34 @@ func TestCertificateSigners(t *testing.T) {
 			},
 		},
 		{
-			name: "certificate naming the record host is listed before others",
+			name: "certificate with a key the registry never signs with is skipped",
+			sigs: func(t *testing.T) []*signv1.Signature {
+				t.Helper()
+
+				id := newTestIdentityWithKey(t, newECDSAKey(t, elliptic.P224()), signersTestSAN)
+				digest := sha256.Sum256([]byte(signersTestCID))
+
+				raw, err := id.key.Sign(rand.Reader, digest[:], crypto.SHA256)
+				require.NoError(t, err)
+
+				return []*signv1.Signature{{Signature: base64.StdEncoding.EncodeToString(raw), Certificate: encodeCert(id.cert)}}
+			},
+		},
+		{
+			name: "signers are listed in signature order",
 			sigs: func(t *testing.T) []*signv1.Signature {
 				t.Helper()
 
 				return []*signv1.Signature{signedBy(t, attacker), signedBy(t, victim)}
 			},
-			wantKeys:  [][]byte{victimKey, mustMarshalKey(t, &attacker.key.PublicKey)},
-			wantCerts: [][]byte{victim.cert.Raw, attacker.cert.Raw},
+			wantKeys:  [][]byte{attackerKey, victimKey},
+			wantCerts: [][]byte{attacker.cert.Raw, victim.cert.Raw},
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			signers, err := certificateSigners(t.Context(), signersTestCID, signersTestHost, tc.sigs(t))
+			signers, err := certificateSigners(t.Context(), signersTestCID, tc.sigs(t))
 			require.NoError(t, err)
 
 			require.Len(t, signers, len(tc.wantKeys))
@@ -268,38 +413,6 @@ func TestCertificateSigners_CanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	_, err := certificateSigners(ctx, signersTestCID, signersTestHost, []*signv1.Signature{signedBy(t, victim)})
+	_, err := certificateSigners(ctx, signersTestCID, []*signv1.Signature{signedBy(t, victim)})
 	require.ErrorIs(t, err, context.Canceled)
-}
-
-func TestNamesHost(t *testing.T) {
-	tests := []struct {
-		name string
-		san  string
-		host string
-		want bool
-	}{
-		{name: "ans uri under the host", san: "ans://v1.0.0.agent.example.com", host: "agent.example.com", want: true},
-		{name: "host comparison ignores case", san: "ans://v1.0.0.Agent.Example.com", host: "AGENT.example.com", want: true},
-		{name: "ans uri with a path", san: "ans://v2.1.0.agent.example.com/assistant", host: "agent.example.com", want: true},
-		{name: "ans uri for another host", san: "ans://v1.0.0.other.example.com", host: "agent.example.com", want: false},
-		{name: "https uri is not an ans name", san: "https://v1.0.0.agent.example.com", host: "agent.example.com", want: false},
-		{name: "no uri", san: "", host: "agent.example.com", want: false},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			id := newTestIdentity(t, tc.san)
-			assert.Equal(t, tc.want, namesHost(id.cert, tc.host))
-		})
-	}
-}
-
-func mustMarshalKey(t *testing.T, key *ecdsa.PublicKey) []byte {
-	t.Helper()
-
-	der, err := x509.MarshalPKIXPublicKey(key)
-	require.NoError(t, err)
-
-	return der
 }

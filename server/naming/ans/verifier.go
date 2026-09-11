@@ -5,20 +5,12 @@ package ans
 
 import (
 	"context"
-	"crypto"
-	"crypto/ecdsa"
-	"crypto/ed25519"
-	"crypto/elliptic"
-	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -28,7 +20,6 @@ import (
 	"github.com/agentnameservice/ans-sdk-go/verify/scitt"
 	"github.com/agntcy/dir/server/naming"
 	ansconfig "github.com/agntcy/dir/server/naming/ans/config"
-	"github.com/agntcy/dir/server/naming/ans/details"
 	"github.com/agntcy/dir/utils/logging"
 )
 
@@ -563,120 +554,6 @@ func (v *Verifier) verifyReceipt(ctx context.Context, client scitt.Client, keys 
 		"leafIndex", receipt.LeafIndex)
 
 	return nil
-}
-
-// eventEnvelope is the part of the log's event envelope the verifier reads:
-// {"payload":{"producer":{"event":{...}}}}.
-type eventEnvelope struct {
-	Payload eventPayload `json:"payload"`
-}
-
-type eventPayload struct {
-	Producer eventProducer `json:"producer"`
-}
-
-type eventProducer struct {
-	Event *producerEvent `json:"event"`
-}
-
-// producerEvent names the agent an event is about. The reference log writes
-// ansId; older envelopes wrote agentId.
-type producerEvent struct {
-	AnsID   string `json:"ansId"`
-	AgentID string `json:"agentId"`
-	AnsName string `json:"ansName"`
-}
-
-func (e *producerEvent) agentID() string {
-	if e.AnsID != "" {
-		return e.AnsID
-	}
-
-	return e.AgentID
-}
-
-var errNotAnEvent = errors.New("envelope carries no agent event")
-
-func decodeEvent(raw []byte) (*producerEvent, error) {
-	var envelope eventEnvelope
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return nil, fmt.Errorf("decode event envelope: %w", err)
-	}
-
-	event := envelope.Payload.Producer.Event
-	if event == nil || event.agentID() == "" {
-		return nil, errNotAnEvent
-	}
-
-	return event, nil
-}
-
-// buildResult renders the matched certificates as published keys together
-// with the verification details.
-func buildResult(want agentName, target badgeTarget, token *scitt.VerifiedStatusToken, matched []*x509.Certificate) (*naming.LookupResult, error) {
-	keys := make([]naming.PublicKey, 0, len(matched))
-
-	for _, cert := range matched {
-		der, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
-		if err != nil {
-			return nil, failWith(stageCertificate, err, "certificate public key cannot be encoded")
-		}
-
-		keys = append(keys, naming.PublicKey{
-			ID:        verify.CertFingerprintFromDER(cert.Raw).String(),
-			Type:      keyTypeOf(cert.PublicKey),
-			Key:       der,
-			KeyBase64: base64.StdEncoding.EncodeToString(der),
-		})
-	}
-
-	receiptURL, err := url.JoinPath(target.LogBase, "v1", "agents", target.AgentID, "receipt")
-	if err != nil {
-		return nil, failWith(stageReceipt, err, "cannot build the receipt URL")
-	}
-
-	encoded, err := json.Marshal(details.Details{
-		Version:     details.Version,
-		AnsName:     want.String(),
-		AgentHost:   want.host,
-		AgentID:     target.AgentID,
-		LogURL:      target.LogBase,
-		ReceiptURL:  receiptURL,
-		AgentStatus: string(token.Payload.Status),
-	})
-	if err != nil {
-		return nil, failWith(stageReceipt, err, "cannot encode verification details")
-	}
-
-	return &naming.LookupResult{Keys: keys, Details: encoded}, nil
-}
-
-// keyTypeOf names the algorithm of a certificate public key the way the
-// naming API reports key types.
-func keyTypeOf(pub crypto.PublicKey) string {
-	switch key := pub.(type) {
-	case *ecdsa.PublicKey:
-		return ecdsaKeyType(key)
-	case ed25519.PublicKey:
-		return "ed25519"
-	case *rsa.PublicKey:
-		return "rsa"
-	default:
-		return "unknown"
-	}
-}
-
-func ecdsaKeyType(key *ecdsa.PublicKey) string {
-	switch key.Curve {
-	case elliptic.P256():
-		return "ecdsa-p256"
-	case elliptic.P384():
-		return "ecdsa-p384"
-	case elliptic.P521():
-		return "ecdsa-p521"
-	default:
-		return "ecdsa"
-	}
 }
 
 // newTransport clones the default transport with the system roots plus the

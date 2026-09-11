@@ -31,6 +31,10 @@ const (
 	// how long a record recorded as unavailable waits before its next attempt.
 	maxRetryDelay = 24 * time.Hour
 
+	// retryBaseDivisor halves the task interval for the first retry so it lands
+	// on the next run rather than one run late.
+	retryBaseDivisor = 2
+
 	// pendingBudget is how long a record may stay pending before it is
 	// recorded as failed.
 	pendingBudget = 24 * time.Hour
@@ -382,7 +386,7 @@ func retrySchedule(existing types.NameVerificationObject, result *naming.Result,
 
 	failures++
 
-	schedule := types.ScanSchedule{RetryBase: interval / 2, RetryMax: maxRetryDelay} //nolint:mnd // half: the first retry lands on the next run
+	schedule := types.ScanSchedule{RetryBase: interval / retryBaseDivisor, RetryMax: maxRetryDelay}
 
 	return failures, schedule.NextAttempt(now, failures)
 }

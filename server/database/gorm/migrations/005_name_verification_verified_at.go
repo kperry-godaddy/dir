@@ -35,7 +35,7 @@ func init() {
 // fills it for rows verified before the column existed.
 //
 // It adds the column itself rather than leaving it to AutoMigrate because
-// custom migrations run first (see migrate in ../migration.go). Mirrors 004.
+// custom migrations run first (see migrate in ../migration.go).
 func runNameVerificationVerifiedAt(db *gorm.DB) error {
 	if !db.Migrator().HasTable(nameVerificationsTable) {
 		return nil

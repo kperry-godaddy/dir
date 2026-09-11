@@ -458,7 +458,7 @@ func (v *Verifier) verifyStatusToken(ctx context.Context, client scitt.Client, k
 
 	payload := &token.Payload
 
-	if payload.AgentID != target.AgentID {
+	if !strings.EqualFold(payload.AgentID, target.AgentID) {
 		return nil, fail(stageStatusToken, fmt.Sprintf("token names agent %s, expected %s", payload.AgentID, target.AgentID))
 	}
 
@@ -539,7 +539,7 @@ func (v *Verifier) verifyReceipt(ctx context.Context, client scitt.Client, keys 
 		return failWith(stageReceipt, err, "event payload is not an ANS event envelope")
 	}
 
-	if event.agentID() != target.AgentID {
+	if !strings.EqualFold(event.agentID(), target.AgentID) {
 		return fail(stageReceipt, fmt.Sprintf("receipt event names agent %s, expected %s", event.agentID(), target.AgentID))
 	}
 

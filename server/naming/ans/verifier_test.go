@@ -16,8 +16,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -126,17 +128,31 @@ func (c *fakeLogClient) callCount() int {
 	return c.calls
 }
 
+func (c *fakeLogClient) setBase(base string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.base = base
+}
+
+func (c *fakeLogClient) logBase() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.base
+}
+
 // countingResolver counts badge lookups on top of the SDK mock and can hold
 // each answer back for a while.
 type countingResolver struct {
 	verify.DNSResolver
 
-	calls int
+	calls atomic.Int64
 	delay time.Duration
 }
 
 func (r *countingResolver) FindBadgeForVersion(ctx context.Context, fqdn models.Fqdn, version models.Version) (*verify.AnsBadgeRecord, error) {
-	r.calls++
+	r.calls.Add(1)
 
 	if r.delay > 0 {
 		select {
@@ -147,6 +163,10 @@ func (r *countingResolver) FindBadgeForVersion(ctx context.Context, fqdn models.
 	}
 
 	return r.DNSResolver.FindBadgeForVersion(ctx, fqdn, version) //nolint:wrapcheck // pass-through test double
+}
+
+func (r *countingResolver) callCount() int {
+	return int(r.calls.Load())
 }
 
 // fixture is a complete, passing verification scenario that individual cases
@@ -240,7 +260,7 @@ func (f *fixture) build() *Verifier {
 
 	if !f.realClient {
 		opts = append(opts, WithLogClientFactory(func(base string) (scitt.Client, error) {
-			f.client.base = base
+			f.client.setBase(base)
 
 			if f.factoryErr != nil {
 				return nil, f.factoryErr
@@ -305,8 +325,8 @@ func runLookupCases(t *testing.T, cases []lookupCase) {
 func assertNetworkUse(t *testing.T, f *fixture, tt lookupCase) {
 	t.Helper()
 
-	if tt.wantNoDNS && f.dns.calls != 0 {
-		t.Errorf("DNS was queried %d times, want none", f.dns.calls)
+	if tt.wantNoDNS && f.dns.callCount() != 0 {
+		t.Errorf("DNS was queried %d times, want none", f.dns.callCount())
 	}
 
 	if (tt.wantNoDNS || tt.wantNoLog) && f.client.callCount() != 0 {
@@ -592,6 +612,14 @@ func TestLookupKeysRootKeysStage(t *testing.T) {
 			wantErr: "ans root-keys: transparency log served no root keys",
 		},
 		{
+			name: "pinned root key line with surrounding whitespace",
+			setup: func(f *fixture) {
+				f.cfg.RootKeys = []string{" " + f.log.rootKeyLine(f.t) + " "}
+			},
+			wantKeys:   1,
+			wantStatus: "ACTIVE",
+		},
+		{
 			name: "pinned keys reject a log signing with another key",
 			setup: func(f *fixture) {
 				f.client.token = mintLog(f.t).statusToken(f.t, f.claims())
@@ -638,6 +666,12 @@ func TestLookupKeysStatusTokenStage(t *testing.T) {
 		{
 			name:       "uppercase token name matches the record",
 			setup:      withClaims(func(claims *tokenClaims) { claims.ansName = "ans://v1.0.0.AGENT.example.com" }),
+			wantKeys:   1,
+			wantStatus: "ACTIVE",
+		},
+		{
+			name:       "uppercase token agent id matches the badge",
+			setup:      withClaims(func(claims *tokenClaims) { claims.agentID = strings.ToUpper(testAgentID) }),
 			wantKeys:   1,
 			wantStatus: "ACTIVE",
 		},
@@ -830,6 +864,14 @@ func TestLookupKeysReceiptStage(t *testing.T) {
 			wantStatus: "ACTIVE",
 		},
 		{
+			name: "uppercase receipt agent id matches the badge",
+			setup: func(f *fixture) {
+				f.setReceipt(eventJSON(f.t, "ansId", strings.ToUpper(testAgentID), testAnsName))
+			},
+			wantKeys:   1,
+			wantStatus: "ACTIVE",
+		},
+		{
 			name: "receipt payload is not an envelope",
 			setup: func(f *fixture) {
 				f.setReceipt([]byte("not json"))
@@ -922,16 +964,16 @@ func TestLookupKeysResult(t *testing.T) {
 		t.Errorf("details = %+v, want %+v", *d, want)
 	}
 
-	if f.client.base != testLogBase {
-		t.Errorf("log client base = %q, want %q", f.client.base, testLogBase)
+	if f.client.logBase() != testLogBase {
+		t.Errorf("log client base = %q, want %q", f.client.logBase(), testLogBase)
 	}
 
 	if len(f.client.agentIDs) != 2 || f.client.agentIDs[0] != testAgentID || f.client.agentIDs[1] != testAgentID {
 		t.Errorf("log fetched agent ids %v, want the badge agent twice", f.client.agentIDs)
 	}
 
-	if f.dns.calls != 1 {
-		t.Errorf("DNS queried %d times, want 1", f.dns.calls)
+	if f.dns.callCount() != 1 {
+		t.Errorf("DNS queried %d times, want 1", f.dns.callCount())
 	}
 }
 
@@ -1200,13 +1242,9 @@ func TestNewVerifier(t *testing.T) {
 		return cfg
 	}
 
-	tests := []struct {
-		name      string
-		cfg       ansconfig.Config
-		wantErr   string
-		wantHosts []string
-	}{
-		{name: "pinned keys", cfg: pinned(nil), wantHosts: []string{testLogHost}},
+	tests := []newVerifierCase{
+		{name: "pinned keys", cfg: pinned(nil), wantHosts: []string{testLogHost}, wantRootKeys: []string{line}},
+		{name: "root key lines are trimmed", cfg: pinned(func(cfg *ansconfig.Config) { cfg.RootKeys = []string{" " + line + "\t"} }), wantRootKeys: []string{line}},
 		{name: "unpinned keys with opt-in", cfg: pinned(func(cfg *ansconfig.Config) { cfg.RootKeys = nil; cfg.AllowUnpinnedRootKeys = true })},
 		{
 			name: "hosts are normalized",
@@ -1231,37 +1269,56 @@ func TestNewVerifier(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			v, err := NewVerifier(tt.cfg)
-
-			if tt.wantErr != "" {
-				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("NewVerifier() error = %v, want containing %q", err, tt.wantErr)
-				}
-
-				return
-			}
-
-			if err != nil {
-				t.Fatalf("NewVerifier() unexpected error: %v", err)
-			}
-
-			if v == nil {
-				t.Fatal("NewVerifier() returned nil")
-			}
-
-			if tt.wantHosts == nil {
-				return
-			}
-
-			if len(v.trustedHosts) != len(tt.wantHosts) {
-				t.Errorf("trusted hosts = %v, want %v", v.trustedHosts, tt.wantHosts)
-			}
-
-			for _, host := range tt.wantHosts {
-				if _, ok := v.trustedHosts[host]; !ok {
-					t.Errorf("trusted hosts %v lack %q", v.trustedHosts, host)
-				}
-			}
+			assertNewVerifier(t, v, err, tt)
 		})
+	}
+}
+
+// newVerifierCase is one NewVerifier scenario: the configuration and either
+// the error or the normalized state expected from it.
+type newVerifierCase struct {
+	name         string
+	cfg          ansconfig.Config
+	wantErr      string
+	wantHosts    []string
+	wantRootKeys []string
+}
+
+func assertNewVerifier(t *testing.T, v *Verifier, err error, tt newVerifierCase) {
+	t.Helper()
+
+	if tt.wantErr != "" {
+		if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+			t.Fatalf("NewVerifier() error = %v, want containing %q", err, tt.wantErr)
+		}
+
+		return
+	}
+
+	if err != nil {
+		t.Fatalf("NewVerifier() unexpected error: %v", err)
+	}
+
+	if v == nil {
+		t.Fatal("NewVerifier() returned nil")
+	}
+
+	if tt.wantRootKeys != nil && !slices.Equal(v.cfg.RootKeys, tt.wantRootKeys) {
+		t.Errorf("root keys = %q, want %q", v.cfg.RootKeys, tt.wantRootKeys)
+	}
+
+	if tt.wantHosts == nil {
+		return
+	}
+
+	if len(v.trustedHosts) != len(tt.wantHosts) {
+		t.Errorf("trusted hosts = %v, want %v", v.trustedHosts, tt.wantHosts)
+	}
+
+	for _, host := range tt.wantHosts {
+		if _, ok := v.trustedHosts[host]; !ok {
+			t.Errorf("trusted hosts %v lack %q", v.trustedHosts, host)
+		}
 	}
 }
 
@@ -1271,7 +1328,7 @@ func TestLookupKeysWithConfiguredDNSServer(t *testing.T) {
 		server string
 	}{
 		{name: "server does not answer", server: "127.0.0.1:1"},
-		{name: "server cannot be dialed", server: "256.256.256.256:53"},
+		{name: "server cannot be dialed", server: "127.0.0.1:99999"},
 	}
 
 	for _, tt := range tests {
@@ -1289,6 +1346,110 @@ func TestLookupKeysWithConfiguredDNSServer(t *testing.T) {
 			if err == nil || !errors.Is(err, naming.ErrTransient) || !strings.Contains(err.Error(), "ans dns:") {
 				t.Fatalf("LookupKeys() error = %v, want a transient dns failure", err)
 			}
+		})
+	}
+}
+
+// lookupOutcome is what one concurrent LookupKeys call returned.
+type lookupOutcome struct {
+	got *naming.LookupResult
+	err error
+}
+
+// runConcurrentLookups calls LookupKeys on the fixture's verifier from n
+// goroutines at once and returns every outcome in call order.
+func runConcurrentLookups(t *testing.T, f *fixture, n int) []lookupOutcome {
+	t.Helper()
+
+	v := f.build()
+	outcomes := make([]lookupOutcome, n)
+
+	var wg sync.WaitGroup
+
+	for i := range n {
+		wg.Go(func() {
+			got, err := v.LookupKeys(t.Context(), f.name, f.evidence)
+			outcomes[i] = lookupOutcome{got: got, err: err}
+		})
+	}
+
+	wg.Wait()
+
+	return outcomes
+}
+
+// TestLookupKeysConcurrent runs many lookups against one Verifier at the same
+// time: the race detector must stay quiet and every lookup must see the same
+// outcome.
+func TestLookupKeysConcurrent(t *testing.T) {
+	const lookups = 32
+
+	tests := []struct {
+		name  string
+		setup func(f *fixture)
+		check func(t *testing.T, f *fixture, outcomes []lookupOutcome)
+	}{
+		{
+			name: "every lookup verifies",
+			check: func(t *testing.T, f *fixture, outcomes []lookupOutcome) {
+				t.Helper()
+
+				for i, outcome := range outcomes {
+					if outcome.err != nil {
+						t.Fatalf("lookup %d: error = %v", i, outcome.err)
+					}
+
+					if len(outcome.got.Keys) != 1 || outcome.got.Keys[0].ID != f.cert.fingerprint {
+						t.Fatalf("lookup %d: keys = %+v, want the attested certificate", i, outcome.got.Keys)
+					}
+
+					if !bytes.Equal(outcome.got.Details, outcomes[0].got.Details) {
+						t.Errorf("lookup %d: details differ from the first lookup", i)
+					}
+				}
+
+				if got := f.client.callCount(); got != 2*lookups {
+					t.Errorf("log called %d times, want %d", got, 2*lookups)
+				}
+
+				if got := f.dns.callCount(); got != lookups {
+					t.Errorf("DNS queried %d times, want %d", got, lookups)
+				}
+			},
+		},
+		{
+			name: "every lookup fails while the log is unreachable",
+			setup: func(f *fixture) {
+				f.client.tokenErr = &scitt.TransportError{Type: scitt.TransportErrHTTPError, Message: "request failed", Cause: errBoom}
+			},
+			check: func(t *testing.T, f *fixture, outcomes []lookupOutcome) {
+				t.Helper()
+
+				for i, outcome := range outcomes {
+					if !errors.Is(outcome.err, naming.ErrTransient) {
+						t.Fatalf("lookup %d: error = %v, want transient", i, outcome.err)
+					}
+				}
+
+				if _, open := f.verifier.breaker.openUntil(testLogHost, testNow); !open {
+					t.Error("circuit is closed after the log failed every lookup")
+				}
+
+				if got := f.client.callCount(); got > lookups {
+					t.Errorf("log called %d times, want at most %d", got, lookups)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t)
+			if tt.setup != nil {
+				tt.setup(f)
+			}
+
+			tt.check(t, f, runConcurrentLookups(t, f, lookups))
 		})
 	}
 }

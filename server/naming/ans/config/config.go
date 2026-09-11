@@ -7,11 +7,9 @@
 package config
 
 import (
-	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
-	"os"
 	"strings"
 	"time"
 )
@@ -67,9 +65,11 @@ func (c *Config) GetTimeout() time.Duration {
 	return c.Timeout
 }
 
-// Validate checks the configuration and normalizes TrustedLogHosts and
-// RootKeys in place (trimmed, hosts lowercased with the default https port
-// removed, empty entries dropped). It reports nothing when Enabled is false.
+// Validate checks the configuration's syntax and normalizes TrustedLogHosts
+// and RootKeys in place (trimmed, hosts lowercased with the default https
+// port removed, empty entries dropped). It opens no file and parses no key;
+// the verifier constructor does both. It reports nothing when Enabled is
+// false.
 func (c *Config) Validate() error {
 	if !c.Enabled {
 		return nil
@@ -101,18 +101,13 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.CAFile != "" {
-		if err := checkCAFile(c.CAFile); err != nil {
-			return err
-		}
-	}
-
 	return nil
 }
 
 // NormalizeHost lowercases a host and drops an explicit default https port so
 // configured hosts and hosts taken from badge URLs compare byte for byte.
-// The input is "host" or "host:port"; IPv6 literals keep their brackets.
+// The input is "host", "host:port", "[ipv6]" or "[ipv6]:port"; IPv6 literals
+// keep their brackets.
 func NormalizeHost(host string) (string, error) {
 	host = strings.TrimSpace(host)
 	if host == "" {
@@ -123,15 +118,13 @@ func NormalizeHost(host string) (string, error) {
 		return "", fmt.Errorf("ans: host %q must not contain a scheme or path", host)
 	}
 
-	name, port := host, ""
+	name, port, err := splitHostPort(host)
+	if err != nil {
+		return "", err
+	}
 
-	if strings.Contains(host, ":") {
-		var err error
-
-		name, port, err = net.SplitHostPort(host)
-		if err != nil {
-			return "", fmt.Errorf("ans: host %q must be host or host:port: %w", host, err)
-		}
+	if name == "" {
+		return "", fmt.Errorf("ans: host %q has no host name", host)
 	}
 
 	name = strings.ToLower(name)
@@ -145,6 +138,25 @@ func NormalizeHost(host string) (string, error) {
 	}
 
 	return net.JoinHostPort(name, port), nil
+}
+
+// splitHostPort separates the optional port from host, accepting a bracketed
+// IPv6 literal without one.
+func splitHostPort(host string) (string, string, error) {
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		return host[1 : len(host)-1], "", nil
+	}
+
+	if !strings.Contains(host, ":") {
+		return host, "", nil
+	}
+
+	name, port, err := net.SplitHostPort(host)
+	if err != nil {
+		return "", "", fmt.Errorf("ans: host %q must be host or host:port: %w", host, err)
+	}
+
+	return name, port, nil
 }
 
 func normalizeHosts(hosts []string) ([]string, error) {
@@ -183,17 +195,4 @@ func trimmed(values []string) []string {
 	}
 
 	return out
-}
-
-func checkCAFile(path string) error {
-	pemBytes, err := os.ReadFile(path) //nolint:gosec // operator-supplied path from configuration
-	if err != nil {
-		return fmt.Errorf("ans: ca_file: %w", err)
-	}
-
-	if !x509.NewCertPool().AppendCertsFromPEM(pemBytes) {
-		return fmt.Errorf("ans: ca_file %q contains no PEM certificates", path)
-	}
-
-	return nil
 }

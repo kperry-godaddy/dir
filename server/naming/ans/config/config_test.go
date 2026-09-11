@@ -4,14 +4,6 @@
 package config
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
-	"math/big"
-	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -51,11 +43,19 @@ func TestNormalizeHost(t *testing.T) {
 		{name: "other port is kept", input: "localhost:18443", want: "localhost:18443"},
 		{name: "surrounding whitespace is trimmed", input: "  log.example.com ", want: "log.example.com"},
 		{name: "ipv6 literal keeps brackets", input: "[::1]:18443", want: "[::1]:18443"},
+		{name: "ipv6 literal on another port", input: "[::1]:8443", want: "[::1]:8443"},
 		{name: "ipv6 literal on default port", input: "[::1]:443", want: "[::1]"},
+		{name: "bare ipv6 literal", input: "[::1]", want: "[::1]"},
+		{name: "bare ipv6 literal is lowercased", input: "[FE80::1]", want: "[fe80::1]"},
 		{name: "empty", input: "   ", wantErr: "must not be empty"},
+		{name: "port only", input: ":443", wantErr: "has no host name"},
+		{name: "colon only", input: ":", wantErr: "has no host name"},
+		{name: "empty brackets with port", input: "[]:443", wantErr: "has no host name"},
+		{name: "empty brackets", input: "[]", wantErr: "has no host name"},
 		{name: "scheme is rejected", input: "https://log.example.com", wantErr: "must not contain a scheme or path"},
 		{name: "path is rejected", input: "log.example.com/v1", wantErr: "must not contain a scheme or path"},
 		{name: "malformed port", input: "log.example.com:443:1", wantErr: "must be host or host:port"},
+		{name: "unbracketed ipv6 literal", input: "::1", wantErr: "must be host or host:port"},
 	}
 
 	for _, tt := range tests {
@@ -82,13 +82,6 @@ func TestNormalizeHost(t *testing.T) {
 }
 
 func TestConfigValidate(t *testing.T) {
-	caFile := writeTestCA(t)
-	notPEM := filepath.Join(t.TempDir(), "not-pem.txt")
-
-	if err := os.WriteFile(notPEM, []byte("hello"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
 	tests := []struct {
 		name      string
 		config    Config
@@ -135,6 +128,15 @@ func TestConfigValidate(t *testing.T) {
 				RootKeys:        []string{"ans-demo+1a2b3c4d+AjBZ"},
 			},
 			wantErr: "must not contain a scheme or path",
+		},
+		{
+			name: "host without a name",
+			config: Config{
+				Enabled:         true,
+				TrustedLogHosts: []string{":443"},
+				RootKeys:        []string{"ans-demo+1a2b3c4d+AjBZ"},
+			},
+			wantErr: "has no host name",
 		},
 		{
 			name: "no root keys without opt-in",
@@ -186,32 +188,12 @@ func TestConfigValidate(t *testing.T) {
 			wantKeys:  []string{"ans-demo+1a2b3c4d+AjBZ"},
 		},
 		{
-			name: "ca file that does not exist",
+			name: "ca file is not opened",
 			config: Config{
 				Enabled:         true,
 				TrustedLogHosts: []string{"log.example.com"},
 				RootKeys:        []string{"ans-demo+1a2b3c4d+AjBZ"},
 				CAFile:          filepath.Join(t.TempDir(), "missing.pem"),
-			},
-			wantErr: "ca_file",
-		},
-		{
-			name: "ca file without certificates",
-			config: Config{
-				Enabled:         true,
-				TrustedLogHosts: []string{"log.example.com"},
-				RootKeys:        []string{"ans-demo+1a2b3c4d+AjBZ"},
-				CAFile:          notPEM,
-			},
-			wantErr: "contains no PEM certificates",
-		},
-		{
-			name: "ca file with a certificate",
-			config: Config{
-				Enabled:         true,
-				TrustedLogHosts: []string{"log.example.com"},
-				RootKeys:        []string{"ans-demo+1a2b3c4d+AjBZ"},
-				CAFile:          caFile,
 			},
 			wantHosts: []string{"log.example.com"},
 			wantKeys:  []string{"ans-demo+1a2b3c4d+AjBZ"},
@@ -245,37 +227,4 @@ func TestConfigValidate(t *testing.T) {
 			}
 		})
 	}
-}
-
-// writeTestCA writes a self-signed certificate to a temp file and returns its path.
-func writeTestCA(t *testing.T) string {
-	t.Helper()
-
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	template := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "test ca"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		IsCA:                  true,
-		BasicConstraintsValid: true,
-	}
-
-	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	path := filepath.Join(t.TempDir(), "ca.pem")
-
-	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	return path
 }

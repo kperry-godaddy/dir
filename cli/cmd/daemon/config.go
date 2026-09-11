@@ -20,6 +20,7 @@ import (
 	reconcilerconfig "github.com/agntcy/dir/reconciler/config"
 	serverconfig "github.com/agntcy/dir/server/config"
 	dbconfig "github.com/agntcy/dir/server/database/config"
+	ansconfig "github.com/agntcy/dir/server/naming/ans/config"
 	storeconfig "github.com/agntcy/dir/server/store/oci/config"
 	"github.com/mitchellh/mapstructure"
 	"github.com/spf13/viper"
@@ -93,6 +94,18 @@ func registerReconcilerDefaults(v *viper.Viper) {
 	v.SetDefault("reconciler.local_registry.auth_config.insecure", true)
 	v.SetDefault("reconciler.database.type", "sqlite")
 	v.SetDefault("reconciler.database.sqlite.path", dbconfig.DefaultSQLitePath)
+
+	// ANS name verification is commented out in daemon.config.yaml, so its keys
+	// must be registered here for AutomaticEnv to resolve them. Mirrors
+	// reconciler/config. The list-valued keys take comma-separated values.
+	v.SetDefault("reconciler.name.ans.enabled", false)
+	v.SetDefault("reconciler.name.ans.timeout", ansconfig.DefaultTimeout)
+	v.SetDefault("reconciler.name.ans.allow_unpinned_root_keys", false)
+
+	_ = v.BindEnv("reconciler.name.ans.trusted_log_hosts")
+	_ = v.BindEnv("reconciler.name.ans.root_keys")
+	_ = v.BindEnv("reconciler.name.ans.dns_server")
+	_ = v.BindEnv("reconciler.name.ans.ca_file")
 }
 
 func registerRuntimeDefaults(v *viper.Viper) {

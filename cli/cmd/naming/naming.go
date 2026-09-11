@@ -25,11 +25,16 @@ naming (e.g., "https://cisco.com/marketing-agent").
 Protocol prefixes (required for verification):
 - https://domain/path - verify using JWKS well-known file (RFC 7517)
 - http://domain/path - verify using JWKS via HTTP (testing only)
+- ans://vX.Y.Z.host[/path] - verify through the Agent Name Service (ANS)
 
 Records without a protocol prefix will not be verified.
 
-Verification method:
-JWKS well-known file: <scheme>://<domain>/.well-known/jwks.json
+Verification methods:
+- JWKS well-known file: <scheme>://<domain>/.well-known/jwks.json
+- ANS: sign the record with the agent's ANS identity key using key-based
+  signing and --certificate <identity-cert.pem>. The reconciler checks the
+  certificate against the agent's _ans-badge DNS record and transparency log.
+  OIDC signatures cannot verify an ans:// name.
 
 Examples:
 

@@ -20,6 +20,8 @@
 #   DIRECTORY_DAEMON_SERVER_STORE_OCI_AUTH_CONFIG_PASSWORD
 #   DIRECTORY_DAEMON_RECONCILER_LOCAL_REGISTRY_AUTH_CONFIG_USERNAME
 #   DIRECTORY_DAEMON_RECONCILER_LOCAL_REGISTRY_AUTH_CONFIG_PASSWORD
+#   DIRECTORY_DAEMON_RECONCILER_NAME_ANS_TRUSTED_LOG_HOSTS  (comma-separated)
+#   DIRECTORY_DAEMON_RECONCILER_NAME_ANS_ROOT_KEYS  (comma-separated)
 
 server:
   listen_address: "localhost:8888"
@@ -126,6 +128,28 @@ reconciler:
     interval: 1m
     ttl: 168h
     record_timeout: 30s
+    # Agent Name Service (ANS) verification for records named
+    # ans://vX.Y.Z.host[/path]. The record must be signed with the agent's ANS
+    # identity key and certificate (dirctl sign --key ... --certificate ...).
+    # ans:
+    #   enabled: false
+    #   # Transparency-log hosts (host or host:port) that _ans-badge records may
+    #   # point at; any other host is rejected before a request is made.
+    #   trusted_log_hosts:
+    #     - "log.ans.example.com"
+    #   # Pinned log signing keys as root-key lines ("origin+kid+base64"),
+    #   # shared by every trusted log. Copy them from each log's /root-keys.
+    #   root_keys:
+    #     - "log.ans.example.com+abcd1234+BASE64KEY"
+    #   # Run without root_keys and trust TLS to the hosts above instead.
+    #   allow_unpinned_root_keys: false
+    #   # Total time budget for one lookup (DNS plus the log fetches); it must
+    #   # stay below record_timeout. Raise it when DNS is slow.
+    #   timeout: 10s
+    #   # Resolver (host:port) for the _ans-badge lookups; empty uses the system resolver.
+    #   dns_server: ""
+    #   # PEM file added to the system roots trusted for log connections.
+    #   ca_file: ""
   scan:
     enabled: true
     interval: 1m

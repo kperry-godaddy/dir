@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	ansconfig "github.com/agntcy/dir/server/naming/ans/config"
 	storeconfig "github.com/agntcy/dir/server/store/oci/config"
 	"github.com/stretchr/testify/require"
 )
@@ -215,4 +216,36 @@ func TestEmbeddedZot(t *testing.T) {
 
 	require.NoError(t, err)
 	require.True(t, zotIsReady)
+}
+
+// TestLoadConfigReconcilerNameANSEnvOverride asserts the ANS name-verification
+// settings can be set by environment alone. The ans block is commented out in
+// the embedded daemon.config.yaml, so this depends on the keys being registered
+// in registerReconcilerDefaults; the list-valued keys take comma-separated values.
+func TestLoadConfigReconcilerNameANSEnvOverride(t *testing.T) {
+	originalOpts := opts
+	opts = &Options{DataDir: t.TempDir()}
+	t.Cleanup(func() {
+		opts = originalOpts
+	})
+
+	cfg, err := loadConfig()
+	require.NoError(t, err)
+	require.False(t, cfg.Reconciler.Name.ANS.Enabled)
+	require.Empty(t, cfg.Reconciler.Name.ANS.TrustedLogHosts)
+	require.Equal(t, ansconfig.DefaultTimeout, cfg.Reconciler.Name.ANS.Timeout)
+
+	t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_ENABLED", "true")
+	t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_TRUSTED_LOG_HOSTS", "a:443,b:443")
+	t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_ROOT_KEYS", "origin+abcd1234+AAAA,origin+ef012345+BBBB")
+	t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_DNS_SERVER", "127.0.0.1:15353")
+	t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_CA_FILE", "/etc/ans/ca.pem")
+
+	cfg, err = loadConfig()
+	require.NoError(t, err)
+	require.True(t, cfg.Reconciler.Name.ANS.Enabled)
+	require.Equal(t, []string{"a:443", "b:443"}, cfg.Reconciler.Name.ANS.TrustedLogHosts)
+	require.Equal(t, []string{"origin+abcd1234+AAAA", "origin+ef012345+BBBB"}, cfg.Reconciler.Name.ANS.RootKeys)
+	require.Equal(t, "127.0.0.1:15353", cfg.Reconciler.Name.ANS.DNSServer)
+	require.Equal(t, "/etc/ans/ca.pem", cfg.Reconciler.Name.ANS.CAFile)
 }

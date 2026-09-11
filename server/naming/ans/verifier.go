@@ -50,6 +50,11 @@ const (
 
 	// breakerCooldown is how long an open circuit fails fast.
 	breakerCooldown = 10 * time.Minute
+
+	// fetchBudgetDivisor bounds one transparency-log fetch to the lookup
+	// budget divided by this, so a stalled request cannot consume the time the
+	// remaining fetches need.
+	fetchBudgetDivisor = 2
 )
 
 var logger = logging.Logger("naming/ans")
@@ -95,14 +100,22 @@ func WithClock(clock scitt.ClockFunc) Option {
 	}
 }
 
-// NewVerifier builds a verifier from a validated configuration. Pinned root
-// keys are parsed here so a malformed line fails startup, and one HTTP
-// transport with ca_file appended to the system roots is shared by every
-// log connection. No network call is made.
+// NewVerifier builds a verifier from an enabled configuration. The
+// configuration is validated here, pinned root keys are parsed so a malformed
+// line fails startup, and one HTTP transport with ca_file appended to the
+// system roots is shared by every log connection. No network call is made.
 func NewVerifier(cfg ansconfig.Config, opts ...Option) (*Verifier, error) {
-	trusted, err := trustedHostSet(cfg.TrustedLogHosts)
-	if err != nil {
-		return nil, err
+	if !cfg.Enabled {
+		return nil, errors.New("ans: the verifier needs an enabled configuration")
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return nil, err //nolint:wrapcheck // the configuration errors already name this component
+	}
+
+	trusted := make(map[string]struct{}, len(cfg.TrustedLogHosts))
+	for _, host := range cfg.TrustedLogHosts {
+		trusted[host] = struct{}{}
 	}
 
 	v := &Verifier{
@@ -124,10 +137,12 @@ func NewVerifier(cfg ansconfig.Config, opts ...Option) (*Verifier, error) {
 			"trustedLogHosts", cfg.TrustedLogHosts)
 	}
 
-	v.transport, err = newTransport(cfg.CAFile)
+	transport, err := newTransport(cfg.CAFile)
 	if err != nil {
 		return nil, err
 	}
+
+	v.transport = transport
 
 	for _, opt := range opts {
 		opt(v)
@@ -190,9 +205,9 @@ func (v *Verifier) lookup(ctx context.Context, name *naming.ParsedName, evidence
 		}
 	}
 
-	client, err := v.newLogClient(target.LogBase)
+	client, err := v.logClient(target)
 	if err != nil {
-		return nil, failWith(stageLog, err, "cannot create a client for the transparency log")
+		return nil, err
 	}
 
 	keys, err := v.keysFor(ctx, client, target)
@@ -256,33 +271,28 @@ func (v *Verifier) filterCertificates(want agentName, evidence naming.Evidence) 
 		return nil, fail(stageCertificate, "no certificate attached to the record's signatures")
 	}
 
-	now := v.clock()
-	outsideValidity := 0
+	filter := &certificateFilter{want: want, now: v.clock()}
 
 	var kept []*x509.Certificate
 
 	for _, der := range evidence.Certificates {
-		cert, ok := parseCandidate(der, want)
-		if !ok {
-			continue
+		if cert := filter.accept(der); cert != nil {
+			kept = append(kept, cert)
 		}
+	}
 
-		if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
-			outsideValidity++
-
-			logger.Warn("Skipping certificate outside its validity window",
-				"fingerprint", verify.CertFingerprintFromDER(der).String(),
-				"notBefore", cert.NotBefore,
-				"notAfter", cert.NotAfter)
-
-			continue
-		}
-
-		kept = append(kept, cert)
+	if filter.skipped() > 0 {
+		logger.Warn("Skipped attached certificates",
+			"ansName", want.String(),
+			"kept", len(kept),
+			"oversized", filter.oversized,
+			"unparsable", filter.unparsable,
+			"otherAgent", filter.otherAgent,
+			"outsideValidity", filter.outsideValidity)
 	}
 
 	if len(kept) == 0 {
-		if outsideValidity > 0 {
+		if filter.outsideValidity > 0 {
 			return nil, fail(stageCertificate, "certificate expired or not yet valid")
 		}
 
@@ -292,32 +302,64 @@ func (v *Verifier) filterCertificates(want agentName, evidence naming.Evidence) 
 	return kept, nil
 }
 
-// parseCandidate parses one attached certificate and reports whether its URI
-// SAN names the agent.
-func parseCandidate(der []byte, want agentName) (*x509.Certificate, bool) {
-	if len(der) > maxCertificateBytes {
-		logger.Warn("Skipping oversized certificate", "bytes", len(der), "limit", maxCertificateBytes)
+// certificateFilter picks the attached certificates that name one agent and
+// are valid at one instant, counting the ones it sets aside by reason.
+type certificateFilter struct {
+	want agentName
+	now  time.Time
 
-		return nil, false
+	oversized       int
+	unparsable      int
+	otherAgent      int
+	outsideValidity int
+}
+
+// accept parses one attached certificate and returns it when its URI SAN
+// names the agent and the instant falls inside its validity window.
+func (f *certificateFilter) accept(der []byte) *x509.Certificate {
+	if len(der) > maxCertificateBytes {
+		f.oversized++
+
+		logger.Debug("Skipping oversized certificate", "bytes", len(der), "limit", maxCertificateBytes)
+
+		return nil
 	}
 
 	cert, err := x509.ParseCertificate(der)
 	if err != nil {
-		logger.Warn("Skipping unparsable certificate", "error", err)
+		f.unparsable++
 
-		return nil, false
+		logger.Debug("Skipping unparsable certificate", "error", err)
+
+		return nil
 	}
 
-	if !want.equals(verify.CertIdentityFromX509(cert).AnsName()) {
-		logger.Warn("Skipping certificate that does not name this agent",
-			"fingerprint", verify.CertFingerprintFromDER(der).String(),
-			"uris", cert.URIs,
-			"ansName", want.String())
+	fingerprint := verify.CertFingerprintFromDER(der).String()
 
-		return nil, false
+	if !f.want.equals(verify.CertIdentityFromX509(cert).AnsName()) {
+		f.otherAgent++
+
+		logger.Debug("Skipping certificate that does not name this agent", "fingerprint", fingerprint)
+
+		return nil
 	}
 
-	return cert, true
+	if f.now.Before(cert.NotBefore) || f.now.After(cert.NotAfter) {
+		f.outsideValidity++
+
+		logger.Debug("Skipping certificate outside its validity window",
+			"fingerprint", fingerprint,
+			"notBefore", cert.NotBefore,
+			"notAfter", cert.NotAfter)
+
+		return nil
+	}
+
+	return cert
+}
+
+func (f *certificateFilter) skipped() int {
+	return f.oversized + f.unparsable + f.otherAgent + f.outsideValidity
 }
 
 // resolveTarget finds the agent's badge record in DNS and checks the URL it
@@ -351,7 +393,7 @@ func (v *Verifier) resolveTarget(ctx context.Context, want agentName) (badgeTarg
 	}
 
 	if _, ok := v.trustedHosts[target.LogHost]; !ok {
-		return badgeTarget{}, fail(stageBadgeURL, fmt.Sprintf("log host %q is not in name.ans.trusted_log_hosts", target.LogHost))
+		return badgeTarget{}, fail(stageBadgeURL, fmt.Sprintf("log host %q is not a trusted transparency log", target.LogHost))
 	}
 
 	return target, nil
@@ -365,6 +407,23 @@ func badgeSourceName(source verify.BadgeRecordSource) string {
 	return "_ans-badge"
 }
 
+// logClient builds the client for the target's log, wrapped so that every
+// fetch is bounded and reported to the host's circuit breaker.
+func (v *Verifier) logClient(target badgeTarget) (scitt.Client, error) {
+	inner, err := v.newLogClient(target.LogBase)
+	if err != nil {
+		return nil, failWith(stageLog, err, "cannot create a client for the transparency log")
+	}
+
+	return &breakerClient{
+		inner:   inner,
+		host:    target.LogHost,
+		breaker: v.breaker,
+		clock:   v.clock,
+		timeout: v.cfg.GetTimeout() / fetchBudgetDivisor,
+	}, nil
+}
+
 // keysFor returns the key store that verifies the log's signatures: the
 // pinned root keys, or the ones fetched from the log when none are pinned.
 func (v *Verifier) keysFor(ctx context.Context, client scitt.Client, target badgeTarget) (scitt.KeyLookup, error) {
@@ -373,8 +432,6 @@ func (v *Verifier) keysFor(ctx context.Context, client scitt.Client, target badg
 	}
 
 	lines, err := client.FetchRootKeys(ctx)
-	v.observe(target.LogHost, err)
-
 	if err != nil {
 		return nil, failWith(stageRootKeys, err, describe(err))
 	}
@@ -393,23 +450,10 @@ func (v *Verifier) keysFor(ctx context.Context, client scitt.Client, target badg
 	return keys, nil
 }
 
-// observe feeds one log request outcome to the breaker and logs a trip.
-func (v *Verifier) observe(host string, err error) {
-	if until, tripped := v.breaker.observe(host, err, v.clock()); tripped {
-		logger.Warn("Transparency log circuit opened after consecutive connection failures",
-			"logHost", host,
-			"failures", breakerThreshold,
-			"until", until,
-			"error", err)
-	}
-}
-
 // verifyStatusToken fetches and verifies the agent's status token and checks
 // that it names this agent and allows connections.
 func (v *Verifier) verifyStatusToken(ctx context.Context, client scitt.Client, keys scitt.KeyLookup, target badgeTarget, want agentName) (*scitt.VerifiedStatusToken, error) {
 	tokenBytes, err := client.FetchStatusToken(ctx, target.AgentID)
-	v.observe(target.LogHost, err)
-
 	if err != nil {
 		return nil, failWith(stageStatusToken, err, describe(err))
 	}
@@ -432,7 +476,7 @@ func (v *Verifier) verifyStatusToken(ctx context.Context, client scitt.Client, k
 	}
 
 	if !payload.Status.IsValidForConnection() {
-		return nil, fail(stageStatusToken, fmt.Sprintf("agent status %s does not allow connections", payload.Status))
+		return nil, failWith(stageStatusToken, statusCause(payload.Status), fmt.Sprintf("agent status %s does not allow connections", payload.Status))
 	}
 
 	logger.Debug("Status token verified",
@@ -488,8 +532,6 @@ func matchCertificates(payload *scitt.StatusTokenPayload, candidates []*x509.Cer
 // and not recorded.
 func (v *Verifier) verifyReceipt(ctx context.Context, client scitt.Client, keys scitt.KeyLookup, target badgeTarget, want agentName) error {
 	receiptBytes, err := client.FetchReceipt(ctx, target.AgentID)
-	v.observe(target.LogHost, err)
-
 	if err != nil {
 		return failWith(stageReceipt, err, describe(err))
 	}
@@ -635,26 +677,6 @@ func ecdsaKeyType(key *ecdsa.PublicKey) string {
 	default:
 		return "ecdsa"
 	}
-}
-
-// trustedHostSet normalizes the configured log hosts into a lookup set.
-func trustedHostSet(hosts []string) (map[string]struct{}, error) {
-	if len(hosts) == 0 {
-		return nil, errors.New("ans: trusted_log_hosts must list at least one transparency-log host")
-	}
-
-	set := make(map[string]struct{}, len(hosts))
-
-	for _, host := range hosts {
-		normalized, err := ansconfig.NormalizeHost(host)
-		if err != nil {
-			return nil, fmt.Errorf("ans: trusted_log_hosts: %w", err)
-		}
-
-		set[normalized] = struct{}{}
-	}
-
-	return set, nil
 }
 
 // newTransport clones the default transport with the system roots plus the

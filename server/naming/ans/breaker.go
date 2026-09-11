@@ -44,15 +44,16 @@ func (b *breaker) openUntil(host string, now time.Time) (time.Time, bool) {
 	return until, true
 }
 
-// observe records the outcome of one request to host. A connection-level
-// failure counts toward the threshold; anything else, including an HTTP error
-// response, proves the host reachable and resets the count. It reports the
-// cooldown end when this observation opened the circuit.
-func (b *breaker) observe(host string, err error, now time.Time) (time.Time, bool) {
+// observe records the outcome of one request to host. A strike is a
+// connection-level failure that counts toward the threshold; any other
+// outcome, including an HTTP error response, proves the host reachable and
+// resets the count. It reports the cooldown end when this observation opened
+// the circuit.
+func (b *breaker) observe(host string, strike bool, now time.Time) (time.Time, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if !isConnectionFailure(err) {
+	if !strike {
 		delete(b.failures, host)
 
 		return time.Time{}, false

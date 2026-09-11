@@ -81,9 +81,16 @@ func TestClassifyPredicates(t *testing.T) {
 			wantDescribe: "transparency log returned HTTP 302",
 		},
 		{
-			name:         "http 404",
-			err:          &scitt.TransportError{Type: scitt.TransportErrNotFound, StatusCode: http.StatusNotFound},
-			wantDescribe: "not found on the transparency log (HTTP 404)",
+			name:          "http 404 is transient",
+			err:           &scitt.TransportError{Type: scitt.TransportErrNotFound, StatusCode: http.StatusNotFound},
+			wantTransient: true,
+			wantDescribe:  "not found on the transparency log (HTTP 404)",
+		},
+		{
+			name:          "not found without a status code",
+			err:           &scitt.TransportError{Type: scitt.TransportErrNotFound},
+			wantTransient: true,
+			wantDescribe:  "not found on the transparency log (HTTP 404)",
 		},
 		{
 			name:         "http 410",
@@ -125,24 +132,37 @@ func TestClassifyPredicates(t *testing.T) {
 			wantDescribe:   "TLS handshake failed",
 		},
 		{
-			name:           "deadline",
-			err:            context.DeadlineExceeded,
-			wantTransient:  true,
-			wantConnection: true,
-			wantDescribe:   "timed out",
+			name:          "deadline",
+			err:           context.DeadlineExceeded,
+			wantTransient: true,
+			wantDescribe:  "timed out",
 		},
 		{
-			name:           "wrapped deadline",
-			err:            fmt.Errorf("fetch: %w", context.DeadlineExceeded),
-			wantTransient:  true,
-			wantConnection: true,
-			wantDescribe:   "timed out",
+			name:          "wrapped deadline",
+			err:           fmt.Errorf("fetch: %w", context.DeadlineExceeded),
+			wantTransient: true,
+			wantDescribe:  "timed out",
 		},
 		{
 			name:          "canceled",
 			err:           context.Canceled,
 			wantTransient: true,
 			wantDescribe:  "canceled",
+		},
+		{
+			name: "canceled inside a transport error is connection-shaped",
+			err: &scitt.TransportError{Type: scitt.TransportErrHTTPError, Message: "request failed", Cause: &url.Error{
+				Op: "Get", URL: "https://log.example.com/v1/agents/x/status-token", Err: context.Canceled,
+			}},
+			wantTransient:  true,
+			wantConnection: true,
+			wantDescribe:   "canceled",
+		},
+		{
+			name:          "pending agent",
+			err:           errAgentPending,
+			wantTransient: true,
+			wantDescribe:  "unexpected failure",
 		},
 		{
 			name:          "token expired",
@@ -227,6 +247,8 @@ func TestClassify(t *testing.T) {
 	transient := failWith(stageDNS, &verify.DNSError{Type: verify.DNSErrorTimeout}, "DNS lookup timed out")
 	retry := &naming.RetryAfterError{Until: time.Unix(1_700_000_000, 0), Err: fail(stageLog, "circuit open")}
 
+	pending := failWith(stageStatusToken, errAgentPending, "agent status PENDING_DNS does not allow connections")
+
 	tests := []struct {
 		name          string
 		err           error
@@ -237,6 +259,7 @@ func TestClassify(t *testing.T) {
 		{name: "nil", err: nil},
 		{name: "terminal passes through", err: terminal, wantErr: "ans certificate: no attached certificate names this agent"},
 		{name: "transient is marked", err: transient, wantErr: "transient verification failure: ans dns: DNS lookup timed out", wantTransient: true},
+		{name: "pending agent is marked", err: pending, wantErr: "transient verification failure: ans status-token: agent status PENDING_DNS does not allow connections", wantTransient: true},
 		{name: "retry after is kept", err: retry, wantErr: "ans log: circuit open (retry after 2023-11-14T22:13:20Z)", wantTransient: true, wantRetry: true},
 	}
 
@@ -285,5 +308,32 @@ func TestStageError(t *testing.T) {
 
 	if got := fail(stageBadgeURL, "x").Error(); got != "ans badge-url: x" {
 		t.Errorf("fail().Error() = %q", got)
+	}
+}
+
+func TestStatusCause(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      scitt.AgentStatus
+		wantPending bool
+	}{
+		{name: "pending dns", status: "PENDING_DNS", wantPending: true},
+		{name: "unknown status", status: "SOMETHING_NEW", wantPending: true},
+		{name: "revoked", status: scitt.StatusRevoked},
+		{name: "expired", status: scitt.StatusExpired},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := statusCause(tt.status)
+
+			if (got != nil) != tt.wantPending {
+				t.Fatalf("statusCause(%q) = %v, want pending %v", tt.status, got, tt.wantPending)
+			}
+
+			if tt.wantPending && !errors.Is(got, errAgentPending) {
+				t.Errorf("statusCause(%q) = %v, want errAgentPending", tt.status, got)
+			}
+		})
 	}
 }

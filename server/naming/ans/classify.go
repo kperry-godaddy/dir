@@ -29,6 +29,10 @@ const (
 	stageReceipt     = "ans receipt"
 )
 
+// errAgentPending marks a status token whose status is neither terminal nor
+// valid for connection: the agent is still on its way to active.
+var errAgentPending = errors.New("agent status is pending")
+
 // stageError is a failure at one step of the trust path. Its text is stable
 // and stage-prefixed; the cause is kept for classification only and never
 // printed, because SDK messages carry resolver addresses and raw HTTP detail.
@@ -57,6 +61,16 @@ func failWith(stage string, cause error, text string) error {
 	return &stageError{stage: stage, text: text, cause: cause}
 }
 
+// statusCause classifies a status that does not allow connections: a
+// terminal one is a verdict, any other may still change.
+func statusCause(status scitt.AgentStatus) error {
+	if status.IsTerminal() {
+		return nil
+	}
+
+	return errAgentPending
+}
+
 // classify marks transient failures with naming.ErrTransient so the caller
 // retries instead of recording a verdict. Terminal failures and breaker
 // RetryAfterErrors pass through unchanged.
@@ -76,12 +90,20 @@ func classify(err error) error {
 	return err
 }
 
-// isTransient reports whether err stems from an unavailable dependency or the
-// caller's own context rather than from the record: DNS or transport trouble,
-// a TLS handshake failure, an exhausted time budget, an expired status token
-// (clock skew), or a log key the pinned set does not know yet.
+// isTransient reports whether err stems from an unavailable dependency, an
+// agent that is not settled yet, or the caller's own context rather than from
+// the record: DNS or transport trouble, a TLS handshake failure, an exhausted
+// time budget, a pending agent, an agent the log has not sealed yet, an
+// expired status token (clock skew), or a log key the pinned set does not
+// know yet.
 func isTransient(err error) bool {
-	if errors.Is(err, naming.ErrTransient) || errors.Is(err, context.Canceled) || isConnectionFailure(err) {
+	for _, sentinel := range []error{naming.ErrTransient, context.Canceled, context.DeadlineExceeded, errAgentPending} {
+		if errors.Is(err, sentinel) {
+			return true
+		}
+	}
+
+	if isConnectionFailure(err) {
 		return true
 	}
 
@@ -90,8 +112,7 @@ func isTransient(err error) bool {
 	}
 
 	if transportErr, ok := errors.AsType[*scitt.TransportError](err); ok {
-		return transportErr.Type == scitt.TransportErrHTTPError &&
-			(transportErr.StatusCode >= http.StatusInternalServerError || transportErr.StatusCode == http.StatusTooManyRequests)
+		return isTransientTransport(transportErr)
 	}
 
 	if tokenErr, ok := errors.AsType[*scitt.TokenError](err); ok {
@@ -105,11 +126,23 @@ func isTransient(err error) bool {
 	return false
 }
 
-// isConnectionFailure reports whether err is a connection-level failure that
-// counts toward a log host's circuit breaker: the request produced no HTTP
-// response at all.
+// isTransientTransport reports whether an HTTP outcome may change on retry:
+// the log is overloaded or throttling, or it does not know the agent yet.
+// The reference log answers 404 until the agent's first event is sealed.
+func isTransientTransport(err *scitt.TransportError) bool {
+	if err.Type == scitt.TransportErrNotFound || err.StatusCode == http.StatusNotFound {
+		return true
+	}
+
+	return err.Type == scitt.TransportErrHTTPError &&
+		(err.StatusCode >= http.StatusInternalServerError || err.StatusCode == http.StatusTooManyRequests)
+}
+
+// isConnectionFailure reports whether err says the log produced no HTTP
+// response at all: a TLS handshake failure, or a transport error carrying a
+// cause and no status code.
 func isConnectionFailure(err error) bool {
-	if errors.Is(err, context.DeadlineExceeded) || isTLSFailure(err) {
+	if isTLSFailure(err) {
 		return true
 	}
 
@@ -174,7 +207,7 @@ func describe(err error) string {
 
 func describeTransport(err *scitt.TransportError) string {
 	switch {
-	case err.StatusCode == http.StatusNotFound:
+	case err.Type == scitt.TransportErrNotFound || err.StatusCode == http.StatusNotFound:
 		return "not found on the transparency log (HTTP 404)"
 	case err.StatusCode == http.StatusGone:
 		return "agent is in a terminal state (HTTP 410)"

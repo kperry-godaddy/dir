@@ -46,8 +46,8 @@ const (
 
 var testNow = time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
 
-// fakeLogClient is a scripted scitt.Client that counts calls and can hold a
-// request open until its context ends.
+// fakeLogClient is a scripted scitt.Client that counts calls, can run a hook
+// on each call, and can hold a request open until its context ends.
 type fakeLogClient struct {
 	mu          sync.Mutex
 	rootKeys    []string
@@ -57,6 +57,7 @@ type fakeLogClient struct {
 	receipt     []byte
 	receiptErr  error
 	block       bool
+	onCall      func()
 	calls       int
 	agentIDs    []string
 	base        string
@@ -106,8 +107,12 @@ func (c *fakeLogClient) enter(ctx context.Context, agentID string) error {
 		c.agentIDs = append(c.agentIDs, agentID)
 	}
 
-	block := c.block
+	block, onCall := c.block, c.onCall
 	c.mu.Unlock()
+
+	if onCall != nil {
+		onCall()
+	}
 
 	if block {
 		<-ctx.Done()
@@ -125,15 +130,25 @@ func (c *fakeLogClient) callCount() int {
 	return c.calls
 }
 
-// countingResolver counts badge lookups on top of the SDK mock.
+// countingResolver counts badge lookups on top of the SDK mock and can hold
+// each answer back for a while.
 type countingResolver struct {
 	verify.DNSResolver
 
 	calls int
+	delay time.Duration
 }
 
 func (r *countingResolver) FindBadgeForVersion(ctx context.Context, fqdn models.Fqdn, version models.Version) (*verify.AnsBadgeRecord, error) {
 	r.calls++
+
+	if r.delay > 0 {
+		select {
+		case <-time.After(r.delay):
+		case <-ctx.Done():
+			return nil, ctx.Err() //nolint:wrapcheck // test double
+		}
+	}
 
 	return r.DNSResolver.FindBadgeForVersion(ctx, fqdn, version) //nolint:wrapcheck // pass-through test double
 }
@@ -488,7 +503,7 @@ func TestLookupKeysBadgeStage(t *testing.T) {
 			setup: func(f *fixture) {
 				f.setBadgeURL("https://evil.example.com/v1/agents/" + testAgentID)
 			},
-			wantErr:   `ans badge-url: log host "evil.example.com" is not in name.ans.trusted_log_hosts`,
+			wantErr:   `ans badge-url: log host "evil.example.com" is not a trusted transparency log`,
 			wantNoLog: true,
 		},
 		{
@@ -496,8 +511,16 @@ func TestLookupKeysBadgeStage(t *testing.T) {
 			setup: func(f *fixture) {
 				f.setBadgeURL("https://log.example.com:8443/v1/agents/" + testAgentID)
 			},
-			wantErr:   `ans badge-url: log host "log.example.com:8443" is not in name.ans.trusted_log_hosts`,
+			wantErr:   `ans badge-url: log host "log.example.com:8443" is not a trusted transparency log`,
 			wantNoLog: true,
+		},
+		{
+			name: "trusted host configured with the default port in mixed case",
+			setup: func(f *fixture) {
+				f.cfg.TrustedLogHosts = []string{" LOG.Example.COM:443 "}
+			},
+			wantKeys:   1,
+			wantStatus: "ACTIVE",
 		},
 		{
 			name: "badge path is not the agent resource",
@@ -649,9 +672,16 @@ func TestLookupKeysStatusTokenStage(t *testing.T) {
 			wantErr: "ans status-token: agent status REVOKED is terminal",
 		},
 		{
-			name:    "pending agent",
-			setup:   withClaims(func(claims *tokenClaims) { claims.status = "PENDING_DNS" }),
-			wantErr: "ans status-token: agent status PENDING_DNS does not allow connections",
+			name:          "pending agent is transient",
+			setup:         withClaims(func(claims *tokenClaims) { claims.status = "PENDING_DNS" }),
+			wantErr:       "ans status-token: agent status PENDING_DNS does not allow connections",
+			wantTransient: true,
+		},
+		{
+			name:          "unknown status is transient",
+			setup:         withClaims(func(claims *tokenClaims) { claims.status = "SOMETHING_NEW" }),
+			wantErr:       "ans status-token: agent status SOMETHING_NEW does not allow connections",
+			wantTransient: true,
 		},
 		{
 			name: "status token 410",
@@ -661,11 +691,19 @@ func TestLookupKeysStatusTokenStage(t *testing.T) {
 			wantErr: "ans status-token: agent is in a terminal state (HTTP 410)",
 		},
 		{
-			name: "status token 404",
+			name: "status token 404 is transient",
 			setup: func(f *fixture) {
 				f.client.tokenErr = &scitt.TransportError{Type: scitt.TransportErrNotFound, StatusCode: http.StatusNotFound}
 			},
-			wantErr: "ans status-token: not found on the transparency log (HTTP 404)",
+			wantErr:       "ans status-token: not found on the transparency log (HTTP 404)",
+			wantTransient: true,
+		},
+		{
+			name: "status token 501",
+			setup: func(f *fixture) {
+				f.client.tokenErr = &scitt.TransportError{Type: scitt.TransportErrNotSupported, StatusCode: http.StatusNotImplemented}
+			},
+			wantErr: "ans status-token: transparency log returned HTTP 501",
 		},
 		{
 			name:          "status token expired",
@@ -757,6 +795,21 @@ func TestLookupKeysReceiptStage(t *testing.T) {
 			},
 			wantErr:       "ans receipt: transparency log returned HTTP 503",
 			wantTransient: true,
+		},
+		{
+			name: "receipt 404 is transient",
+			setup: func(f *fixture) {
+				f.client.receiptErr = &scitt.TransportError{Type: scitt.TransportErrNotFound, StatusCode: http.StatusNotFound}
+			},
+			wantErr:       "ans receipt: not found on the transparency log (HTTP 404)",
+			wantTransient: true,
+		},
+		{
+			name: "receipt 410 is terminal",
+			setup: func(f *fixture) {
+				f.client.receiptErr = &scitt.TransportError{Type: scitt.TransportErrAgentTerminal, StatusCode: http.StatusGone}
+			},
+			wantErr: "ans receipt: agent is in a terminal state (HTTP 410)",
 		},
 		{
 			name: "receipt names another agent",
@@ -1142,52 +1195,41 @@ func TestNewVerifier(t *testing.T) {
 	junkFile := writeFile(t, "junk.pem", []byte("junk"))
 	missingFile := filepath.Join(t.TempDir(), "missing.pem")
 
+	pinned := func(mutate func(cfg *ansconfig.Config)) ansconfig.Config {
+		cfg := ansconfig.Config{Enabled: true, TrustedLogHosts: []string{testLogHost}, RootKeys: []string{line}}
+		if mutate != nil {
+			mutate(&cfg)
+		}
+
+		return cfg
+	}
+
 	tests := []struct {
-		name    string
-		cfg     ansconfig.Config
-		wantErr string
+		name      string
+		cfg       ansconfig.Config
+		wantErr   string
+		wantHosts []string
 	}{
+		{name: "pinned keys", cfg: pinned(nil), wantHosts: []string{testLogHost}},
+		{name: "unpinned keys with opt-in", cfg: pinned(func(cfg *ansconfig.Config) { cfg.RootKeys = nil; cfg.AllowUnpinnedRootKeys = true })},
 		{
-			name: "pinned keys",
-			cfg:  ansconfig.Config{TrustedLogHosts: []string{testLogHost}, RootKeys: []string{line}},
+			name: "hosts are normalized",
+			cfg: pinned(func(cfg *ansconfig.Config) {
+				cfg.TrustedLogHosts = []string{" LOG.Example.com:443 ", "Other.example.com:8443"}
+			}),
+			wantHosts: []string{"log.example.com", "other.example.com:8443"},
 		},
-		{
-			name: "unpinned keys",
-			cfg:  ansconfig.Config{TrustedLogHosts: []string{testLogHost}, AllowUnpinnedRootKeys: true},
-		},
-		{
-			name:    "malformed root key",
-			cfg:     ansconfig.Config{TrustedLogHosts: []string{testLogHost}, RootKeys: []string{"not-a-key"}},
-			wantErr: "ans: root_keys",
-		},
-		{
-			name:    "no trusted hosts",
-			cfg:     ansconfig.Config{RootKeys: []string{line}},
-			wantErr: "ans: trusted_log_hosts",
-		},
-		{
-			name:    "malformed trusted host",
-			cfg:     ansconfig.Config{TrustedLogHosts: []string{"https://log.example.com"}, RootKeys: []string{line}},
-			wantErr: "must not contain a scheme or path",
-		},
-		{
-			name:    "missing ca file",
-			cfg:     ansconfig.Config{TrustedLogHosts: []string{testLogHost}, RootKeys: []string{line}, CAFile: missingFile},
-			wantErr: "ans: ca_file",
-		},
-		{
-			name:    "ca file without certificates",
-			cfg:     ansconfig.Config{TrustedLogHosts: []string{testLogHost}, RootKeys: []string{line}, CAFile: junkFile},
-			wantErr: "contains no PEM certificates",
-		},
-		{
-			name: "ca file",
-			cfg:  ansconfig.Config{TrustedLogHosts: []string{testLogHost}, RootKeys: []string{line}, CAFile: caFile},
-		},
-		{
-			name: "dns server",
-			cfg:  ansconfig.Config{TrustedLogHosts: []string{testLogHost}, RootKeys: []string{line}, DNSServer: "127.0.0.1:1"},
-		},
+		{name: "ca file", cfg: pinned(func(cfg *ansconfig.Config) { cfg.CAFile = caFile })},
+		{name: "dns server", cfg: pinned(func(cfg *ansconfig.Config) { cfg.DNSServer = "127.0.0.1:1" })},
+		{name: "disabled configuration", cfg: pinned(func(cfg *ansconfig.Config) { cfg.Enabled = false }), wantErr: "enabled configuration"},
+		{name: "malformed root key", cfg: pinned(func(cfg *ansconfig.Config) { cfg.RootKeys = []string{"not-a-key"} }), wantErr: "ans: root_keys"},
+		{name: "no trusted hosts", cfg: pinned(func(cfg *ansconfig.Config) { cfg.TrustedLogHosts = nil }), wantErr: "ans: trusted_log_hosts"},
+		{name: "malformed trusted host", cfg: pinned(func(cfg *ansconfig.Config) { cfg.TrustedLogHosts = []string{"https://log.example.com"} }), wantErr: "must not contain a scheme or path"},
+		{name: "unpinned keys without opt-in", cfg: pinned(func(cfg *ansconfig.Config) { cfg.RootKeys = nil }), wantErr: "root_keys is empty"},
+		{name: "negative timeout", cfg: pinned(func(cfg *ansconfig.Config) { cfg.Timeout = -time.Second }), wantErr: "timeout must not be negative"},
+		{name: "dns server without port", cfg: pinned(func(cfg *ansconfig.Config) { cfg.DNSServer = "127.0.0.1" }), wantErr: "dns_server must be host:port"},
+		{name: "missing ca file", cfg: pinned(func(cfg *ansconfig.Config) { cfg.CAFile = missingFile }), wantErr: "ans: ca_file"},
+		{name: "ca file without certificates", cfg: pinned(func(cfg *ansconfig.Config) { cfg.CAFile = junkFile }), wantErr: "contains no PEM certificates"},
 	}
 
 	for _, tt := range tests {
@@ -1208,6 +1250,20 @@ func TestNewVerifier(t *testing.T) {
 
 			if v == nil {
 				t.Fatal("NewVerifier() returned nil")
+			}
+
+			if tt.wantHosts == nil {
+				return
+			}
+
+			if len(v.trustedHosts) != len(tt.wantHosts) {
+				t.Errorf("trusted hosts = %v, want %v", v.trustedHosts, tt.wantHosts)
+			}
+
+			for _, host := range tt.wantHosts {
+				if _, ok := v.trustedHosts[host]; !ok {
+					t.Errorf("trusted hosts %v lack %q", v.trustedHosts, host)
+				}
 			}
 		})
 	}

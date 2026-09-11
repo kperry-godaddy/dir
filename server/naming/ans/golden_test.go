@@ -129,11 +129,11 @@ func TestGoldenFixtures(t *testing.T) {
 	}{
 		{
 			name: "pinned root keys",
-			cfg:  ansconfig.Config{TrustedLogHosts: []string{g.logHost}, RootKeys: g.rootKeys},
+			cfg:  ansconfig.Config{Enabled: true, TrustedLogHosts: []string{g.logHost}, RootKeys: g.rootKeys},
 		},
 		{
 			name: "fetched root keys",
-			cfg:  ansconfig.Config{TrustedLogHosts: []string{g.logHost}, AllowUnpinnedRootKeys: true},
+			cfg:  ansconfig.Config{Enabled: true, TrustedLogHosts: []string{g.logHost}, AllowUnpinnedRootKeys: true},
 		},
 	}
 

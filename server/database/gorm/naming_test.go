@@ -115,7 +115,7 @@ func TestNameVerification_RoundTripsEveryColumn(t *testing.T) {
 	assert.False(t, got.GetUpdatedAt().IsZero())
 }
 
-func TestUpdateNameVerification_ReplacesVerdictAndClearsNilColumns(t *testing.T) {
+func TestUpdateNameVerification_WritesEveryColumnAndClearsNilOnes(t *testing.T) {
 	t.Parallel()
 
 	db := setupNamingDB(t)
@@ -153,7 +153,7 @@ func TestUpdateNameVerification_ReplacesVerdictAndClearsNilColumns(t *testing.T)
 	assert.Nil(t, row.VerifiedAt)
 	assert.Equal(t, 0, row.ConsecutiveFailures)
 	assert.Nil(t, row.NextAttemptAt)
-	assert.True(t, row.UpdatedAt.After(past), "a verdict write moves updated_at")
+	assert.True(t, row.UpdatedAt.After(past), "an update moves updated_at")
 }
 
 func TestUpdateNameVerification_MissingRow(t *testing.T) {
@@ -171,79 +171,6 @@ func TestGetVerificationByCID_MissingRow(t *testing.T) {
 	db := setupNamingDB(t)
 
 	_, err := db.GetVerificationByCID(namingTestCID)
-	require.ErrorIs(t, err, ErrVerificationNotFound)
-}
-
-// --- UpdateNameVerificationSchedule ---
-
-func TestUpdateNameVerificationSchedule_LeavesVerdictColumnsUntouched(t *testing.T) {
-	t.Parallel()
-
-	db := setupNamingDB(t)
-
-	verifiedAt := time.Now().Add(-time.Hour).Truncate(time.Second)
-
-	require.NoError(t, db.CreateNameVerification(&NameVerification{
-		RecordCID:  namingTestCID,
-		Method:     string(naming.MethodANS),
-		KeyID:      "SHA256:abc",
-		Status:     VerificationStatusVerified,
-		Details:    namingTestDetails,
-		VerifiedAt: &verifiedAt,
-	}))
-
-	past := time.Now().Add(-30 * time.Minute).Truncate(time.Second)
-	setNameVerificationUpdatedAt(t, db, namingTestCID, past)
-
-	nextAttemptAt := time.Now().Add(2 * time.Hour).Truncate(time.Second)
-
-	require.NoError(t, db.UpdateNameVerificationSchedule(namingTestCID, VerificationStatusVerified, 1, &nextAttemptAt, "transient: ans dns: lookup timed out"))
-
-	row := loadNameVerification(t, db, namingTestCID)
-
-	assert.WithinDuration(t, past, row.UpdatedAt, time.Second, "a schedule write must not move updated_at")
-	assert.Equal(t, "SHA256:abc", row.KeyID)
-	assert.JSONEq(t, namingTestDetails, row.Details)
-	require.NotNil(t, row.VerifiedAt)
-	assert.WithinDuration(t, verifiedAt, *row.VerifiedAt, time.Second)
-
-	assert.Equal(t, VerificationStatusVerified, row.Status)
-	assert.Equal(t, 1, row.ConsecutiveFailures)
-	require.NotNil(t, row.NextAttemptAt)
-	assert.WithinDuration(t, nextAttemptAt, *row.NextAttemptAt, time.Second)
-	assert.Equal(t, "transient: ans dns: lookup timed out", row.Error)
-}
-
-func TestUpdateNameVerificationSchedule_ClearsNextAttemptWithNil(t *testing.T) {
-	t.Parallel()
-
-	db := setupNamingDB(t)
-
-	nextAttemptAt := time.Now().Add(time.Hour)
-
-	require.NoError(t, db.CreateNameVerification(&NameVerification{
-		RecordCID:           namingTestCID,
-		Method:              string(naming.MethodANS),
-		Status:              VerificationStatusPending,
-		ConsecutiveFailures: 4,
-		NextAttemptAt:       &nextAttemptAt,
-	}))
-
-	require.NoError(t, db.UpdateNameVerificationSchedule(namingTestCID, VerificationStatusPending, 0, nil, ""))
-
-	row := loadNameVerification(t, db, namingTestCID)
-
-	assert.Equal(t, 0, row.ConsecutiveFailures)
-	assert.Nil(t, row.NextAttemptAt)
-	assert.Empty(t, row.Error)
-}
-
-func TestUpdateNameVerificationSchedule_MissingRow(t *testing.T) {
-	t.Parallel()
-
-	db := setupNamingDB(t)
-
-	err := db.UpdateNameVerificationSchedule(namingTestCID, VerificationStatusPending, 1, nil, "transient")
 	require.ErrorIs(t, err, ErrVerificationNotFound)
 }
 

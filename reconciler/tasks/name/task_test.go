@@ -81,14 +81,6 @@ func (f *fakeFetcher) PullPublicKeys(_ context.Context, ref *corev1.RecordRef) (
 	return f.publicKeys, f.keyErr
 }
 
-type scheduleCall struct {
-	cid           string
-	status        string
-	failures      int
-	nextAttemptAt *time.Time
-	errMsg        string
-}
-
 type fakeDB struct {
 	types.DatabaseAPI
 
@@ -97,13 +89,11 @@ type fakeDB struct {
 	existing   *gormdb.NameVerification
 	getErr     error
 
-	createErr   error
-	updateErr   error
-	scheduleErr error
+	createErr error
+	updateErr error
 
-	created   []types.NameVerificationObject
-	updated   []types.NameVerificationObject
-	scheduled []scheduleCall
+	created []types.NameVerificationObject
+	updated []types.NameVerificationObject
 }
 
 func (f *fakeDB) GetRecordsNeedingVerification(time.Duration) ([]coretypes.Record, error) {
@@ -134,14 +124,8 @@ func (f *fakeDB) UpdateNameVerification(v types.NameVerificationObject) error {
 	return f.updateErr
 }
 
-func (f *fakeDB) UpdateNameVerificationSchedule(cid string, status string, failures int, nextAttemptAt *time.Time, errMsg string) error {
-	f.scheduled = append(f.scheduled, scheduleCall{cid: cid, status: status, failures: failures, nextAttemptAt: nextAttemptAt, errMsg: errMsg})
-
-	return f.scheduleErr
-}
-
 func (f *fakeDB) writes() int {
-	return len(f.created) + len(f.updated) + len(f.scheduled)
+	return len(f.created) + len(f.updated)
 }
 
 // fakeLookup is the ans:// method: it records the evidence it was given and
@@ -267,7 +251,6 @@ func TestTask_Run_ANSCertificateSignersAreBound(t *testing.T) {
 
 	require.Len(t, db.created, 1)
 	assert.Empty(t, db.updated)
-	assert.Empty(t, db.scheduled)
 
 	row := db.created[0]
 	assert.Equal(t, taskTestCID, row.GetRecordCID())
@@ -463,11 +446,13 @@ type writeKind int
 const (
 	writeCreate writeKind = iota
 	writeUpdate
-	writeSchedule
 )
 
+// existingVerifiedAt is when a verified row built by existingRow last verified.
+var existingVerifiedAt = fixedNow.Add(-2 * time.Hour)
+
 func existingRow(status string, failures int) *gormdb.NameVerification {
-	verifiedAt := fixedNow.Add(-2 * time.Hour)
+	verifiedAt := existingVerifiedAt
 
 	row := &gormdb.NameVerification{
 		RecordCID:           taskTestCID,
@@ -527,18 +512,21 @@ func TestTask_Run_PersistenceStateMachine(t *testing.T) {
 			interval:        time.Hour,
 			existing:        existingRow(gormdb.VerificationStatusVerified, 0),
 			lookupErr:       transientErr,
-			want:            writeSchedule,
+			want:            writeUpdate,
 			wantStatus:      gormdb.VerificationStatusVerified,
 			wantFailures:    1,
 			wantNext:        at(time.Hour),
 			wantErrContains: "transient: ans dns: lookup timed out",
+			wantKeyID:       victimKeyID,
+			wantVerifiedAt:  &existingVerifiedAt,
+			wantDetails:     taskTestDetails,
 		},
 		{
 			name:            "third strike doubles twice",
 			interval:        time.Hour,
 			existing:        existingRow(gormdb.VerificationStatusPending, 2),
 			lookupErr:       transientErr,
-			want:            writeSchedule,
+			want:            writeUpdate,
 			wantStatus:      gormdb.VerificationStatusPending,
 			wantFailures:    3,
 			wantNext:        at(4 * time.Hour),
@@ -549,7 +537,7 @@ func TestTask_Run_PersistenceStateMachine(t *testing.T) {
 			interval:        time.Hour,
 			existing:        existingRow(gormdb.VerificationStatusPending, 6),
 			lookupErr:       transientErr,
-			want:            writeSchedule,
+			want:            writeUpdate,
 			wantStatus:      gormdb.VerificationStatusPending,
 			wantFailures:    7,
 			wantNext:        at(24 * time.Hour),
@@ -582,7 +570,7 @@ func TestTask_Run_PersistenceStateMachine(t *testing.T) {
 			interval:        time.Hour,
 			existing:        existingRow(gormdb.VerificationStatusPending, 3),
 			lookupErr:       &naming.RetryAfterError{Until: fixedNow.Add(10 * time.Minute), Err: errLookupDown},
-			want:            writeSchedule,
+			want:            writeUpdate,
 			wantStatus:      gormdb.VerificationStatusPending,
 			wantFailures:    3,
 			wantNext:        at(10 * time.Minute),
@@ -603,7 +591,7 @@ func TestTask_Run_PersistenceStateMachine(t *testing.T) {
 			interval:      time.Hour,
 			existing:      existingRow(gormdb.VerificationStatusFailed, 0),
 			lookupErr:     transientErr,
-			want:          writeSchedule,
+			want:          writeUpdate,
 			wantStatus:    gormdb.VerificationStatusFailed,
 			wantFailures:  1,
 			wantNext:      at(time.Hour),
@@ -656,48 +644,29 @@ func TestTask_Run_PersistenceStateMachine(t *testing.T) {
 
 			require.Equal(t, 1, db.writes(), "exactly one write per record")
 
-			switch tc.want {
-			case writeCreate, writeUpdate:
-				rows := db.created
-				if tc.want == writeUpdate {
-					rows = db.updated
-				}
+			rows := db.created
+			if tc.want == writeUpdate {
+				rows = db.updated
+			}
 
-				require.Len(t, rows, 1)
+			require.Len(t, rows, 1)
 
-				row := rows[0]
-				assert.Equal(t, taskTestCID, row.GetRecordCID())
-				assert.Equal(t, string(naming.MethodANS), row.GetMethod())
-				assert.Equal(t, tc.wantStatus, row.GetStatus())
-				assert.Equal(t, tc.wantFailures, row.GetConsecutiveFailures())
-				assert.Equal(t, tc.wantNext, row.GetNextAttemptAt())
-				assert.Equal(t, tc.wantKeyID, row.GetKeyID())
-				assert.Equal(t, tc.wantDetails, row.GetDetails())
-				assert.Equal(t, tc.wantVerifiedAt, row.GetVerifiedAt())
+			row := rows[0]
+			assert.Equal(t, taskTestCID, row.GetRecordCID())
+			assert.Equal(t, string(naming.MethodANS), row.GetMethod())
+			assert.Equal(t, tc.wantStatus, row.GetStatus())
+			assert.Equal(t, tc.wantFailures, row.GetConsecutiveFailures())
+			assert.Equal(t, tc.wantNext, row.GetNextAttemptAt())
+			assert.Equal(t, tc.wantKeyID, row.GetKeyID())
+			assert.Equal(t, tc.wantDetails, row.GetDetails())
+			assert.Equal(t, tc.wantVerifiedAt, row.GetVerifiedAt())
 
-				if tc.wantErrEquals != "" {
-					assert.Equal(t, tc.wantErrEquals, row.GetError())
-				}
+			if tc.wantErrEquals != "" {
+				assert.Equal(t, tc.wantErrEquals, row.GetError())
+			}
 
-				if tc.wantErrContains != "" {
-					assert.Contains(t, row.GetError(), tc.wantErrContains)
-				}
-			case writeSchedule:
-				require.Len(t, db.scheduled, 1)
-
-				call := db.scheduled[0]
-				assert.Equal(t, taskTestCID, call.cid)
-				assert.Equal(t, tc.wantStatus, call.status)
-				assert.Equal(t, tc.wantFailures, call.failures)
-				assert.Equal(t, tc.wantNext, call.nextAttemptAt)
-
-				if tc.wantErrEquals != "" {
-					assert.Equal(t, tc.wantErrEquals, call.errMsg)
-				}
-
-				if tc.wantErrContains != "" {
-					assert.Contains(t, call.errMsg, tc.wantErrContains)
-				}
+			if tc.wantErrContains != "" {
+				assert.Contains(t, row.GetError(), tc.wantErrContains)
 			}
 		})
 	}
@@ -780,7 +749,7 @@ func TestTask_Run_WriteFailuresAreTolerated(t *testing.T) {
 		{name: "create verdict fails", db: func() *fakeDB { return &fakeDB{createErr: writeErr} }},
 		{name: "update verdict fails", existing: existingRow(gormdb.VerificationStatusPending, 1), db: func() *fakeDB { return &fakeDB{updateErr: writeErr} }},
 		{name: "create pending fails", lookupErr: transientErr, db: func() *fakeDB { return &fakeDB{createErr: writeErr} }},
-		{name: "schedule write fails", existing: existingRow(gormdb.VerificationStatusVerified, 0), lookupErr: transientErr, db: func() *fakeDB { return &fakeDB{scheduleErr: writeErr} }},
+		{name: "schedule write fails", existing: existingRow(gormdb.VerificationStatusVerified, 0), lookupErr: transientErr, db: func() *fakeDB { return &fakeDB{updateErr: writeErr} }},
 	}
 
 	for _, tc := range tests {

@@ -29,10 +29,6 @@ const (
 var ErrVerificationNotFound = errors.New("verification not found")
 
 // NameVerification stores name verification result for a record (one per CID).
-//
-// updated_at moves only on a verdict (verified or failed). Transient failures
-// are recorded through UpdateNameVerificationSchedule, which changes the
-// status, the failure counter, the retry time and the error alone.
 type NameVerification struct {
 	ID        uint `gorm:"primarykey"`
 	CreatedAt time.Time
@@ -45,10 +41,10 @@ type NameVerification struct {
 	Error     string         // error message (if failed or pending)
 
 	Details    string     `gorm:"type:text"` // method-specific JSON recorded with a verified result
-	VerifiedAt *time.Time // last successful verification
+	VerifiedAt *time.Time // when the row last verified: set by a verified verdict, kept through pending, cleared by a failed verdict
 
 	ConsecutiveFailures int        `gorm:"not null;default:0"` // transient failures since the last verdict
-	NextAttemptAt       *time.Time `gorm:"index"`              // scheduled retry; NULL leaves the row to the TTL
+	NextAttemptAt       *time.Time // scheduled retry; NULL leaves the row to the TTL
 }
 
 // Implement types.NameVerificationObject interface.
@@ -120,9 +116,8 @@ func (d *DB) CreateNameVerification(verification types.NameVerificationObject) e
 	return nil
 }
 
-// UpdateNameVerification replaces the verdict of an existing name verification
-// for a record. Every verdict column is written, so a nil verified_at or
-// next_attempt_at clears the stored value; updated_at moves.
+// UpdateNameVerification writes every column of the existing name verification
+// for a record, so a nil verified_at or next_attempt_at clears the stored value.
 func (d *DB) UpdateNameVerification(verification types.NameVerificationObject) error {
 	result := d.gormDB.Model(&NameVerification{}).
 		Where("record_cid = ?", verification.GetRecordCID()).
@@ -150,36 +145,6 @@ func (d *DB) UpdateNameVerification(verification types.NameVerificationObject) e
 	return nil
 }
 
-// UpdateNameVerificationSchedule records the retry state of a transient
-// failure. Only status, consecutive_failures, next_attempt_at and error are
-// written; updated_at, key_id, details and verified_at keep their values.
-func (d *DB) UpdateNameVerificationSchedule(cid string, status string, consecutiveFailures int, nextAttemptAt *time.Time, errMsg string) error {
-	result := d.gormDB.Model(&NameVerification{}).
-		Where("record_cid = ?", cid).
-		UpdateColumns(map[string]any{
-			"status":               status,
-			"consecutive_failures": consecutiveFailures,
-			"next_attempt_at":      nextAttemptAt,
-			"error":                errMsg,
-		})
-
-	if result.Error != nil {
-		return fmt.Errorf("failed to update name verification schedule: %w", result.Error)
-	}
-
-	if result.RowsAffected == 0 {
-		return ErrVerificationNotFound
-	}
-
-	logger.Debug("Updated name verification schedule",
-		"record_cid", cid,
-		"status", status,
-		"consecutive_failures", consecutiveFailures,
-		"next_attempt_at", nextAttemptAt)
-
-	return nil
-}
-
 // GetVerificationByCID retrieves the verification for a record.
 // Returns ErrVerificationNotFound if no verification exists.
 func (d *DB) GetVerificationByCID(cid string) (types.NameVerificationObject, error) {
@@ -201,9 +166,6 @@ func (d *DB) GetVerificationByCID(cid string) (types.NameVerificationObject, err
 //
 // A scheduled retry wins over the TTL: a row with a next_attempt_at is
 // selected exactly when that time has passed, however old its updated_at is.
-// Otherwise a previously verified row in the transient state, whose
-// updated_at no longer moves, would be re-selected on every run and the
-// backoff would never apply.
 func (d *DB) GetRecordsNeedingVerification(ttl time.Duration) ([]coretypes.Record, error) {
 	now := time.Now()
 	expiredBefore := now.Add(-ttl)

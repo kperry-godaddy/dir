@@ -136,7 +136,7 @@ func (n *namingCtrl) GetVerificationInfo(ctx context.Context, req *namingv1.GetV
 // verification time is reported on the envelope for every method; the domain
 // arm repeats it for clients that predate the envelope field.
 func (n *namingCtrl) buildVerification(ctx context.Context, cid string, latest types.NameVerificationObject) (*namingv1.Verification, error) {
-	verifiedAt := timestamppb.New(verifiedAtOf(latest))
+	verifiedAt := timestamppb.New(*latest.GetVerifiedAt())
 
 	var verification *namingv1.Verification
 
@@ -187,25 +187,14 @@ func buildAnsVerification(cid string, latest types.NameVerificationObject) (*nam
 	}, nil
 }
 
-// verifiedAtOf is when the row's verdict was reached. Rows written before the
-// verified_at column existed report updated_at, which for a verified row is
-// the time of that verdict.
-func verifiedAtOf(v types.NameVerificationObject) time.Time {
-	if at := v.GetVerifiedAt(); at != nil {
-		return *at
-	}
-
-	return v.GetUpdatedAt()
-}
-
-// isVerificationValid checks if a verification is valid (verified status and not expired).
+// isVerificationValid reports whether the row is a verified verdict whose
+// verified_at is within the TTL.
 func (n *namingCtrl) isVerificationValid(v types.NameVerificationObject) bool {
-	if v.GetStatus() != gormdb.VerificationStatusVerified {
+	if v.GetStatus() != gormdb.VerificationStatusVerified || v.GetVerifiedAt() == nil {
 		return false
 	}
 
-	// Check if verification has expired: updated_at + ttl < now
-	return time.Now().Before(v.GetUpdatedAt().Add(n.ttl))
+	return time.Now().Before(v.GetVerifiedAt().Add(n.ttl))
 }
 
 // getDomainFromRecord extracts the domain from a record's name.

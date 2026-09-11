@@ -5,8 +5,7 @@ package types
 
 import "time"
 
-// NameVerificationRetryState is the retry bookkeeping of a name verification.
-// It is written on transient failures without touching the verdict columns.
+// NameVerificationRetryState is the retry schedule of a name verification.
 type NameVerificationRetryState interface {
 	// GetConsecutiveFailures counts transient failures since the last verdict.
 	GetConsecutiveFailures() int
@@ -30,8 +29,8 @@ type NameVerificationObject interface {
 	// empty when the method records none.
 	GetDetails() string
 
-	// GetVerifiedAt is when the record last verified successfully, nil when
-	// it never has.
+	// GetVerifiedAt is when the row last verified, nil when it never has or
+	// its last verdict was a failure.
 	GetVerifiedAt() *time.Time
 
 	GetCreatedAt() time.Time

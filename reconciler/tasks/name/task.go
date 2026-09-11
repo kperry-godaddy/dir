@@ -255,8 +255,8 @@ func (t *Task) recordResult(cid, recordName string, result *naming.Result, start
 }
 
 // persist writes the result to the record's row. A verdict (verified or
-// terminal failure) replaces the row and moves updated_at; a transient failure
-// only changes the retry state, so the previous verdict stays readable.
+// terminal failure) replaces the row; a transient failure only advances the
+// retry state, so the previous verdict stays readable.
 func (t *Task) persist(cid string, result *naming.Result) {
 	existing, err := t.db.GetVerificationByCID(cid)
 	if err != nil && !errors.Is(err, gormdb.ErrVerificationNotFound) {
@@ -353,7 +353,19 @@ func (t *Task) writeSchedule(cid string, existing types.NameVerificationObject, 
 
 	status, errMsg := scheduleStatus(existing, transientErr)
 
-	if err := t.db.UpdateNameVerificationSchedule(cid, status, failures, &nextAttemptAt, errMsg); err != nil {
+	row := &gormdb.NameVerification{
+		RecordCID:           cid,
+		Method:              existing.GetMethod(),
+		KeyID:               existing.GetKeyID(),
+		Status:              status,
+		Error:               errMsg,
+		Details:             existing.GetDetails(),
+		VerifiedAt:          existing.GetVerifiedAt(),
+		ConsecutiveFailures: failures,
+		NextAttemptAt:       &nextAttemptAt,
+	}
+
+	if err := t.db.UpdateNameVerification(row); err != nil {
 		logger.Warn("Failed to update name verification schedule", "cid", cid, "error", err)
 	}
 }

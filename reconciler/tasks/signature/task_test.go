@@ -271,10 +271,6 @@ func (f *fakeSignatureDB) UpdateNameVerification(verification types.NameVerifica
 	return nil
 }
 
-func (f *fakeSignatureDB) UpdateNameVerificationSchedule(cid string, status string, consecutiveFailures int, nextAttemptAt *time.Time, errMsg string) error {
-	return nil
-}
-
 func (f *fakeSignatureDB) GetVerificationByCID(cid string) (types.NameVerificationObject, error) {
 	return nil, nil
 }

@@ -10,6 +10,9 @@ import (
 	"time"
 
 	"github.com/agntcy/dir/reconciler/tasks"
+	"github.com/agntcy/dir/reconciler/tasks/name"
+	ansconfig "github.com/agntcy/dir/server/naming/ans/config"
+	servertypes "github.com/agntcy/dir/server/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -138,3 +141,94 @@ func TestStart_ContextCancelStopsTaskLoop(t *testing.T) {
 
 // Ensure mockTask satisfies tasks.Task.
 var _ tasks.Task = (*mockTask)(nil)
+
+// fakeStore is a store without referrer support.
+type fakeStore struct{ servertypes.StoreAPI }
+
+// fakeReferrerStore is a store with referrer support. Registration calls no
+// method on it.
+type fakeReferrerStore struct {
+	servertypes.StoreAPI
+	servertypes.ReferrerStoreAPI
+}
+
+type fakeDB struct{ servertypes.DatabaseAPI }
+
+func TestRegisterNameTask(t *testing.T) {
+	const logHost = "log.example.com"
+
+	tests := []struct {
+		name      string
+		cfg       name.Config
+		store     servertypes.StoreAPI
+		wantTasks int
+		wantErr   string
+	}{
+		{
+			name:      "store without referrers registers nothing",
+			cfg:       name.Config{Enabled: true},
+			store:     fakeStore{},
+			wantTasks: 0,
+		},
+		{
+			name:      "ans disabled registers the name task",
+			cfg:       name.Config{Enabled: true},
+			store:     fakeReferrerStore{},
+			wantTasks: 1,
+		},
+		{
+			name: "ans enabled registers the name task",
+			cfg: name.Config{Enabled: true, ANS: ansconfig.Config{
+				Enabled:               true,
+				TrustedLogHosts:       []string{logHost},
+				AllowUnpinnedRootKeys: true,
+			}},
+			store:     fakeReferrerStore{},
+			wantTasks: 1,
+		},
+		{
+			name:    "ans enabled without trusted hosts fails",
+			cfg:     name.Config{Enabled: true, ANS: ansconfig.Config{Enabled: true}},
+			store:   fakeReferrerStore{},
+			wantErr: "trusted_log_hosts",
+		},
+		{
+			name: "ans timeout not shorter than record timeout fails",
+			cfg: name.Config{Enabled: true, RecordTimeout: 10 * time.Second, ANS: ansconfig.Config{
+				Enabled:               true,
+				TrustedLogHosts:       []string{logHost},
+				AllowUnpinnedRootKeys: true,
+				Timeout:               10 * time.Second,
+			}},
+			store:   fakeReferrerStore{},
+			wantErr: "must be shorter than record_timeout",
+		},
+		{
+			name: "unparseable root key fails verifier construction",
+			cfg: name.Config{Enabled: true, ANS: ansconfig.Config{
+				Enabled:         true,
+				TrustedLogHosts: []string{logHost},
+				RootKeys:        []string{"not-a-root-key"},
+			}},
+			store:   fakeReferrerStore{},
+			wantErr: "failed to create ans name verifier",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newTestService()
+
+			err := s.registerNameTask(tt.cfg, fakeDB{}, tt.store)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				assert.Empty(t, s.tasks)
+
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Len(t, s.tasks, tt.wantTasks)
+		})
+	}
+}

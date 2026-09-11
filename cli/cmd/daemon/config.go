@@ -95,9 +95,9 @@ func registerReconcilerDefaults(v *viper.Viper) {
 	v.SetDefault("reconciler.database.type", "sqlite")
 	v.SetDefault("reconciler.database.sqlite.path", dbconfig.DefaultSQLitePath)
 
-	// ANS name verification is commented out in daemon.config.yaml, so its keys
-	// must be registered here for AutomaticEnv to resolve them. Mirrors
-	// reconciler/config. The list-valued keys take comma-separated values.
+	// The ans block is commented out in daemon.config.yaml and AutomaticEnv only
+	// resolves keys viper already knows, so they are registered here. The
+	// list-valued keys take comma-separated values.
 	v.SetDefault("reconciler.name.ans.enabled", false)
 	v.SetDefault("reconciler.name.ans.timeout", ansconfig.DefaultTimeout)
 	v.SetDefault("reconciler.name.ans.allow_unpinned_root_keys", false)
@@ -232,4 +232,5 @@ func resolveRelativePaths(cfg *DaemonConfig) {
 	cfg.Server.Routing.KeyPath = resolve(cfg.Server.Routing.KeyPath)
 	cfg.Server.Routing.DatastoreDir = resolve(cfg.Server.Routing.DatastoreDir)
 	cfg.Server.Database.SQLite.Path = resolve(cfg.Server.Database.SQLite.Path)
+	cfg.Reconciler.Name.ANS.CAFile = resolve(cfg.Reconciler.Name.ANS.CAFile)
 }

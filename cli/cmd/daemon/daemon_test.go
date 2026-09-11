@@ -218,34 +218,110 @@ func TestEmbeddedZot(t *testing.T) {
 	require.True(t, zotIsReady)
 }
 
-// TestLoadConfigReconcilerNameANSEnvOverride asserts the ANS name-verification
-// settings can be set by environment alone. The ans block is commented out in
-// the embedded daemon.config.yaml, so this depends on the keys being registered
-// in registerReconcilerDefaults; the list-valued keys take comma-separated values.
+// TestLoadConfigReconcilerNameANSEnvOverride asserts every ANS name-verification
+// key can be set by environment alone, for the embedded defaults and for a
+// user-supplied config file that does not declare the ans block.
 func TestLoadConfigReconcilerNameANSEnvOverride(t *testing.T) {
+	dataDir := t.TempDir()
+
+	configPath := filepath.Join(dataDir, DefaultConfigFile)
+	require.NoError(t, os.WriteFile(configPath, []byte(defaultConfigYAML), 0o600))
+
+	for name, configFile := range map[string]string{
+		"embedded config":    "",
+		"user-supplied file": configPath,
+	} {
+		t.Run(name, func(t *testing.T) {
+			originalOpts := opts
+			opts = &Options{DataDir: dataDir, ConfigFile: configFile}
+
+			t.Cleanup(func() {
+				opts = originalOpts
+			})
+
+			cfg, err := loadConfig()
+			require.NoError(t, err)
+			require.False(t, cfg.Reconciler.Name.ANS.Enabled)
+			require.Empty(t, cfg.Reconciler.Name.ANS.TrustedLogHosts)
+			require.Empty(t, cfg.Reconciler.Name.ANS.RootKeys)
+			require.False(t, cfg.Reconciler.Name.ANS.AllowUnpinnedRootKeys)
+			require.Equal(t, ansconfig.DefaultTimeout, cfg.Reconciler.Name.ANS.Timeout)
+			require.Empty(t, cfg.Reconciler.Name.ANS.DNSServer)
+			require.Empty(t, cfg.Reconciler.Name.ANS.CAFile)
+
+			t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_ENABLED", "true")
+			t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_TRUSTED_LOG_HOSTS", "a:443,b:443")
+			t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_ROOT_KEYS", "origin+abcd1234+AAAA,origin+ef012345+BBBB")
+			t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_ALLOW_UNPINNED_ROOT_KEYS", "true")
+			t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_TIMEOUT", "30s")
+			t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_DNS_SERVER", "127.0.0.1:15353")
+			t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_CA_FILE", "ans/ca.pem")
+
+			cfg, err = loadConfig()
+			require.NoError(t, err)
+			require.True(t, cfg.Reconciler.Name.ANS.Enabled)
+			require.Equal(t, []string{"a:443", "b:443"}, cfg.Reconciler.Name.ANS.TrustedLogHosts)
+			require.Equal(t, []string{"origin+abcd1234+AAAA", "origin+ef012345+BBBB"}, cfg.Reconciler.Name.ANS.RootKeys)
+			require.True(t, cfg.Reconciler.Name.ANS.AllowUnpinnedRootKeys)
+			require.Equal(t, 30*time.Second, cfg.Reconciler.Name.ANS.Timeout)
+			require.Equal(t, "127.0.0.1:15353", cfg.Reconciler.Name.ANS.DNSServer)
+			require.Equal(t, filepath.Join(dataDir, "ans/ca.pem"), cfg.Reconciler.Name.ANS.CAFile)
+		})
+	}
+}
+
+// TestResolveRelativePaths asserts every path setting is resolved against the
+// data directory when relative and left alone when absolute or empty.
+func TestResolveRelativePaths(t *testing.T) {
+	dataDir := t.TempDir()
+
 	originalOpts := opts
-	opts = &Options{DataDir: t.TempDir()}
+	opts = &Options{DataDir: dataDir}
+
 	t.Cleanup(func() {
 		opts = originalOpts
 	})
 
-	cfg, err := loadConfig()
-	require.NoError(t, err)
-	require.False(t, cfg.Reconciler.Name.ANS.Enabled)
-	require.Empty(t, cfg.Reconciler.Name.ANS.TrustedLogHosts)
-	require.Equal(t, ansconfig.DefaultTimeout, cfg.Reconciler.Name.ANS.Timeout)
+	tests := []struct {
+		name string
+		path string
+		want string
+	}{
+		{
+			name: "relative path joins the data dir",
+			path: filepath.Join("ans", "ca.pem"),
+			want: filepath.Join(dataDir, "ans", "ca.pem"),
+		},
+		{
+			name: "absolute path is kept",
+			path: filepath.Join(string(filepath.Separator), "etc", "ans", "ca.pem"),
+			want: filepath.Join(string(filepath.Separator), "etc", "ans", "ca.pem"),
+		},
+		{
+			name: "empty path is left for the service default",
+		},
+	}
 
-	t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_ENABLED", "true")
-	t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_TRUSTED_LOG_HOSTS", "a:443,b:443")
-	t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_ROOT_KEYS", "origin+abcd1234+AAAA,origin+ef012345+BBBB")
-	t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_DNS_SERVER", "127.0.0.1:15353")
-	t.Setenv("DIRECTORY_DAEMON_RECONCILER_NAME_ANS_CA_FILE", "/etc/ans/ca.pem")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &DaemonConfig{}
+			cfg.Server.Store.OCI.LocalDir = tt.path
+			cfg.Server.Routing.KeyPath = tt.path
+			cfg.Server.Routing.DatastoreDir = tt.path
+			cfg.Server.Database.SQLite.Path = tt.path
+			cfg.Reconciler.Name.ANS.CAFile = tt.path
 
-	cfg, err = loadConfig()
-	require.NoError(t, err)
-	require.True(t, cfg.Reconciler.Name.ANS.Enabled)
-	require.Equal(t, []string{"a:443", "b:443"}, cfg.Reconciler.Name.ANS.TrustedLogHosts)
-	require.Equal(t, []string{"origin+abcd1234+AAAA", "origin+ef012345+BBBB"}, cfg.Reconciler.Name.ANS.RootKeys)
-	require.Equal(t, "127.0.0.1:15353", cfg.Reconciler.Name.ANS.DNSServer)
-	require.Equal(t, "/etc/ans/ca.pem", cfg.Reconciler.Name.ANS.CAFile)
+			resolveRelativePaths(cfg)
+
+			for key, got := range map[string]string{
+				"server.store.oci.local_dir":   cfg.Server.Store.OCI.LocalDir,
+				"server.routing.key_path":      cfg.Server.Routing.KeyPath,
+				"server.routing.datastore_dir": cfg.Server.Routing.DatastoreDir,
+				"server.database.sqlite.path":  cfg.Server.Database.SQLite.Path,
+				"reconciler.name.ans.ca_file":  cfg.Reconciler.Name.ANS.CAFile,
+			} {
+				require.Equal(t, tt.want, got, key)
+			}
+		})
+	}
 }

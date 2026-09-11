@@ -28,6 +28,7 @@ import (
 	"github.com/agentnameservice/ans-sdk-go/verify/scitt"
 	"github.com/agntcy/dir/server/naming"
 	ansconfig "github.com/agntcy/dir/server/naming/ans/config"
+	"github.com/agntcy/dir/server/naming/ans/details"
 	"github.com/agntcy/dir/utils/logging"
 )
 
@@ -209,12 +210,11 @@ func (v *Verifier) lookup(ctx context.Context, name *naming.ParsedName, evidence
 		return nil, fail(stageCertificate, "no attached certificate is attested for this agent")
 	}
 
-	receipt, err := v.verifyReceipt(ctx, client, keys, target, want)
-	if err != nil {
+	if err := v.verifyReceipt(ctx, client, keys, target, want); err != nil {
 		return nil, err
 	}
 
-	return buildResult(want, target, token, receipt, matched)
+	return buildResult(want, target, token, matched)
 }
 
 // agentName is the structural identity of an ANS name: the lowercase agent
@@ -484,34 +484,34 @@ func matchCertificates(payload *scitt.StatusTokenPayload, candidates []*x509.Cer
 // and the inclusion path travel in the unsigned COSE header; the SDK checks
 // that they are well-formed and walks the path to a root it compares with
 // nothing. The receipt therefore proves that the log signed this event and
-// nothing about the event's position in the tree. TreeSize and LeafIndex are
-// recorded as reported, not verified.
-func (v *Verifier) verifyReceipt(ctx context.Context, client scitt.Client, keys scitt.KeyLookup, target badgeTarget, want agentName) (*scitt.VerifiedReceipt, error) {
+// nothing about the event's position in the tree, so the position is logged
+// and not recorded.
+func (v *Verifier) verifyReceipt(ctx context.Context, client scitt.Client, keys scitt.KeyLookup, target badgeTarget, want agentName) error {
 	receiptBytes, err := client.FetchReceipt(ctx, target.AgentID)
 	v.observe(target.LogHost, err)
 
 	if err != nil {
-		return nil, failWith(stageReceipt, err, describe(err))
+		return failWith(stageReceipt, err, describe(err))
 	}
 
 	receipt, err := scitt.VerifyReceipt(receiptBytes, keys)
 	if err != nil {
 		logger.Debug("Receipt rejected", "agentId", target.AgentID, "logBase", target.LogBase, "error", err)
 
-		return nil, failWith(stageReceipt, err, describe(err))
+		return failWith(stageReceipt, err, describe(err))
 	}
 
 	event, err := decodeEvent(receipt.EventBytes)
 	if err != nil {
-		return nil, failWith(stageReceipt, err, "event payload is not an ANS event envelope")
+		return failWith(stageReceipt, err, "event payload is not an ANS event envelope")
 	}
 
 	if event.agentID() != target.AgentID {
-		return nil, fail(stageReceipt, fmt.Sprintf("receipt event names agent %s, expected %s", event.agentID(), target.AgentID))
+		return fail(stageReceipt, fmt.Sprintf("receipt event names agent %s, expected %s", event.agentID(), target.AgentID))
 	}
 
 	if !want.matches(event.AnsName) {
-		return nil, fail(stageReceipt, fmt.Sprintf("receipt event names %s, expected %s", event.AnsName, want))
+		return fail(stageReceipt, fmt.Sprintf("receipt event names %s, expected %s", event.AnsName, want))
 	}
 
 	logger.Debug("Receipt verified",
@@ -520,7 +520,7 @@ func (v *Verifier) verifyReceipt(ctx context.Context, client scitt.Client, keys 
 		"treeSize", receipt.TreeSize,
 		"leafIndex", receipt.LeafIndex)
 
-	return receipt, nil
+	return nil
 }
 
 // eventEnvelope is the part of the log's event envelope the verifier reads:
@@ -571,7 +571,7 @@ func decodeEvent(raw []byte) (*producerEvent, error) {
 
 // buildResult renders the matched certificates as published keys together
 // with the verification details.
-func buildResult(want agentName, target badgeTarget, token *scitt.VerifiedStatusToken, receipt *scitt.VerifiedReceipt, matched []*x509.Certificate) (*naming.LookupResult, error) {
+func buildResult(want agentName, target badgeTarget, token *scitt.VerifiedStatusToken, matched []*x509.Certificate) (*naming.LookupResult, error) {
 	keys := make([]naming.PublicKey, 0, len(matched))
 
 	for _, cert := range matched {
@@ -588,26 +588,25 @@ func buildResult(want agentName, target badgeTarget, token *scitt.VerifiedStatus
 		})
 	}
 
-	receiptURI, err := url.JoinPath(target.LogBase, "v1", "agents", target.AgentID, "receipt")
+	receiptURL, err := url.JoinPath(target.LogBase, "v1", "agents", target.AgentID, "receipt")
 	if err != nil {
-		return nil, failWith(stageReceipt, err, "cannot build the receipt URI")
+		return nil, failWith(stageReceipt, err, "cannot build the receipt URL")
 	}
 
-	details, err := json.Marshal(Details{
-		Version:     DetailsVersion,
+	encoded, err := json.Marshal(details.Details{
+		Version:     details.Version,
 		AnsName:     want.String(),
+		AgentHost:   want.host,
 		AgentID:     target.AgentID,
 		LogURL:      target.LogBase,
-		ReceiptURI:  receiptURI,
+		ReceiptURL:  receiptURL,
 		AgentStatus: string(token.Payload.Status),
-		TreeSize:    receipt.TreeSize,
-		LeafIndex:   receipt.LeafIndex,
 	})
 	if err != nil {
 		return nil, failWith(stageReceipt, err, "cannot encode verification details")
 	}
 
-	return &naming.LookupResult{Keys: keys, Details: details}, nil
+	return &naming.LookupResult{Keys: keys, Details: encoded}, nil
 }
 
 // keyTypeOf names the algorithm of a certificate public key the way the

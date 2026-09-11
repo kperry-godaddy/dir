@@ -18,6 +18,7 @@ import (
 	"github.com/agentnameservice/ans-sdk-go/verify/scitt"
 	"github.com/agntcy/dir/server/naming"
 	ansconfig "github.com/agntcy/dir/server/naming/ans/config"
+	"github.com/agntcy/dir/server/naming/ans/details"
 )
 
 // The files under testdata/ were captured from the ANS reference
@@ -168,27 +169,22 @@ func assertGoldenResult(t *testing.T, g golden, got *naming.LookupResult) {
 		t.Errorf("key ID = %q, want %q", got.Keys[0].ID, want)
 	}
 
-	details, err := DecodeDetails(got.Details)
+	d, err := details.Decode(got.Details)
 	if err != nil {
-		t.Fatalf("DecodeDetails() error = %v", err)
+		t.Fatalf("details.Decode() error = %v", err)
 	}
 
-	want := Details{
-		Version:     DetailsVersion,
+	want := details.Details{
+		Version:     details.Version,
 		AnsName:     g.fixture.AnsName,
+		AgentHost:   strings.ToLower(naming.ParseName(g.fixture.AnsName).Domain),
 		AgentID:     g.fixture.AgentID,
 		LogURL:      g.logBase,
-		ReceiptURI:  g.logBase + "/v1/agents/" + g.fixture.AgentID + "/receipt",
+		ReceiptURL:  g.logBase + "/v1/agents/" + g.fixture.AgentID + "/receipt",
 		AgentStatus: "ACTIVE",
-		TreeSize:    details.TreeSize,
-		LeafIndex:   details.LeafIndex,
 	}
 
-	if *details != want {
-		t.Errorf("details = %+v, want %+v", *details, want)
-	}
-
-	if details.TreeSize == 0 {
-		t.Error("TreeSize was not recorded from the receipt")
+	if *d != want {
+		t.Errorf("details = %+v, want %+v", *d, want)
 	}
 }

@@ -24,9 +24,9 @@ import (
 
 const (
 	namingTestCID     = "baeareitestnaming0000000000000000000000000000000000000000000000"
-	namingTestDetails = `{"v":1,"ansName":"ans://v1.0.0.agent.example.com","agentId":"agent-1",` +
-		`"logUrl":"https://log.example.com","receiptUri":"https://log.example.com/v1/agents/agent-1/receipt",` +
-		`"agentStatus":"ACTIVE","treeSize":10,"leafIndex":3}`
+	namingTestDetails = `{"v":1,"ansName":"ans://v1.0.0.agent.example.com","agentHost":"agent.example.com","agentId":"agent-1",` +
+		`"logUrl":"https://log.example.com","receiptUrl":"https://log.example.com/v1/agents/agent-1/receipt",` +
+		`"agentStatus":"ACTIVE"}`
 )
 
 type fakeNamingDB struct {
@@ -97,11 +97,12 @@ func TestGetVerificationInfo_AnsRowMapsDetails(t *testing.T) {
 	assert.Nil(t, resp.GetVerification().GetDomain())
 	assert.Equal(t, "ans://v1.0.0.agent.example.com", ans.GetAnsName())
 	assert.Equal(t, "agent-1", ans.GetAgentId())
+	assert.Equal(t, "agent.example.com", ans.GetAgentHost())
 	assert.Equal(t, "https://log.example.com", ans.GetLogUrl())
-	assert.Equal(t, "https://log.example.com/v1/agents/agent-1/receipt", ans.GetReceiptUri())
+	assert.Equal(t, "https://log.example.com/v1/agents/agent-1/receipt", ans.GetReceiptUrl())
 	assert.Equal(t, "SHA256:abc", ans.GetCertFingerprint())
 	assert.Equal(t, "ACTIVE", ans.GetAgentStatus())
-	assert.Equal(t, verifiedAt.Unix(), ans.GetVerifiedAt().AsTime().Unix())
+	assert.Equal(t, verifiedAt.Unix(), resp.GetVerification().GetVerifiedAt().AsTime().Unix())
 }
 
 func TestGetVerificationInfo_AnsRowWithUnusableDetails(t *testing.T) {
@@ -111,7 +112,7 @@ func TestGetVerificationInfo_AnsRowWithUnusableDetails(t *testing.T) {
 	}{
 		{name: "empty details", details: ""},
 		{name: "malformed json", details: `{"v":1,`},
-		{name: "unsupported version", details: `{"v":2,"ansName":"ans://v1.0.0.agent.example.com"}`},
+		{name: "newer version", details: `{"v":99,"ansName":"ans://v1.0.0.agent.example.com"}`},
 	}
 
 	for _, tc := range tests {
@@ -121,20 +122,22 @@ func TestGetVerificationInfo_AnsRowWithUnusableDetails(t *testing.T) {
 			ctrl := newNamingController(db, &fakeNamingStore{}, time.Hour)
 
 			resp, err := ctrl.GetVerificationInfo(t.Context(), &namingv1.GetVerificationInfoRequest{Cid: new(namingTestCID)})
-			require.NoError(t, err)
-			assert.True(t, resp.GetVerified(), "unreadable details must not hide a verified record")
-
-			ans := resp.GetVerification().GetAns()
-			require.NotNil(t, ans)
-			assert.Equal(t, "SHA256:abc", ans.GetCertFingerprint())
-			assert.Equal(t, verifiedAt.Unix(), ans.GetVerifiedAt().AsTime().Unix())
-			assert.Empty(t, ans.GetAnsName())
-			assert.Empty(t, ans.GetAgentId())
-			assert.Empty(t, ans.GetLogUrl())
-			assert.Empty(t, ans.GetReceiptUri())
-			assert.Empty(t, ans.GetAgentStatus())
+			require.Error(t, err, "a verified row whose details cannot be read must not be served")
+			assert.Equal(t, codes.Internal, status.Code(err))
+			assert.Nil(t, resp)
 		})
 	}
+}
+
+func TestGetVerificationInfo_UnknownMethodIsAnError(t *testing.T) {
+	verifiedAt := time.Now().Add(-time.Minute)
+	db := &fakeNamingDB{verification: verifiedRow("did", "kid-9", "", &verifiedAt)}
+	ctrl := newNamingController(db, &fakeNamingStore{}, time.Hour)
+
+	resp, err := ctrl.GetVerificationInfo(t.Context(), &namingv1.GetVerificationInfoRequest{Cid: new(namingTestCID)})
+	require.Error(t, err)
+	assert.Equal(t, codes.Internal, status.Code(err))
+	assert.Nil(t, resp)
 }
 
 func TestGetVerificationInfo_WellKnownRowMapsDomain(t *testing.T) {
@@ -158,6 +161,7 @@ func TestGetVerificationInfo_WellKnownRowMapsDomain(t *testing.T) {
 	assert.Equal(t, string(naming.MethodWellKnown), domain.GetMethod())
 	assert.Equal(t, "kid-1", domain.GetKeyId())
 	assert.Equal(t, verifiedAt.Unix(), domain.GetVerifiedAt().AsTime().Unix())
+	assert.Equal(t, verifiedAt.Unix(), resp.GetVerification().GetVerifiedAt().AsTime().Unix())
 }
 
 func TestGetVerificationInfo_WellKnownRowWithoutRecordLeavesDomainEmpty(t *testing.T) {
@@ -180,7 +184,7 @@ func TestGetVerificationInfo_VerifiedAtFallsBackToUpdatedAt(t *testing.T) {
 
 	resp, err := ctrl.GetVerificationInfo(t.Context(), &namingv1.GetVerificationInfoRequest{Cid: new(namingTestCID)})
 	require.NoError(t, err)
-	assert.Equal(t, row.UpdatedAt.Unix(), resp.GetVerification().GetAns().GetVerifiedAt().AsTime().Unix())
+	assert.Equal(t, row.UpdatedAt.Unix(), resp.GetVerification().GetVerifiedAt().AsTime().Unix())
 }
 
 func TestGetVerificationInfo_NotVerifiedRows(t *testing.T) {

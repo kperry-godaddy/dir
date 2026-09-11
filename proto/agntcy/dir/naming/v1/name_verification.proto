@@ -17,6 +17,9 @@ message Verification {
     AnsVerification ans = 2;
     // Future verification types can be added here.
   }
+
+  // When the verification was performed, whichever method verified the name.
+  google.protobuf.Timestamp verified_at = 3;
 }
 
 // AnsVerification represents the result of verifying that a record's
@@ -30,22 +33,22 @@ message AnsVerification {
   // The agent identifier in the transparency log.
   string agent_id = 2;
 
+  // The agent host of the ANS name (e.g., "agent.example.com").
+  string agent_host = 3;
+
   // Base URL of the transparency log that attested the certificate.
-  string log_url = 3;
+  string log_url = 4;
 
   // URL of the agent's SCITT receipt on the transparency log.
-  string receipt_uri = 4;
+  string receipt_url = 5;
 
   // SHA-256 fingerprint ("SHA256:<hex>") of the identity certificate whose
   // key signed the record. Matches the transparency log's attestation.
-  string cert_fingerprint = 5;
+  string cert_fingerprint = 6;
 
-  // Agent status reported by the transparency log at verification time
-  // (ACTIVE, WARNING, or DEPRECATED).
-  string agent_status = 6;
-
-  // When the verification was performed.
-  google.protobuf.Timestamp verified_at = 7;
+  // Agent status as reported by the transparency log at verification time.
+  // A verified record carries ACTIVE, WARNING, or DEPRECATED.
+  string agent_status = 7;
 }
 
 // DomainVerification represents the result of verifying that a record's

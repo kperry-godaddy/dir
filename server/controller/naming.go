@@ -14,7 +14,7 @@ import (
 	namingv1 "github.com/agntcy/dir/api/naming/v1"
 	gormdb "github.com/agntcy/dir/server/database/gorm"
 	"github.com/agntcy/dir/server/naming"
-	"github.com/agntcy/dir/server/naming/ans"
+	"github.com/agntcy/dir/server/naming/ans/details"
 	namingconfig "github.com/agntcy/dir/server/naming/config"
 	"github.com/agntcy/dir/server/types"
 	"github.com/agntcy/dir/utils/logging"
@@ -121,57 +121,75 @@ func (n *namingCtrl) GetVerificationInfo(ctx context.Context, req *namingv1.GetV
 	// Return valid verification from database
 	namingLogger.Debug("Returning verification from database", "cid", cid)
 
+	verification, err := n.buildVerification(ctx, cid, latest)
+	if err != nil {
+		return nil, err
+	}
+
 	return &namingv1.GetVerificationInfoResponse{
 		Verified:     true,
-		Verification: n.buildVerification(ctx, cid, latest),
+		Verification: verification,
 	}, nil
 }
 
-// buildVerification maps a verified row to the wire shape of its method: an
-// AnsVerification for the ans method, a DomainVerification otherwise.
-func (n *namingCtrl) buildVerification(ctx context.Context, cid string, latest types.NameVerificationObject) *namingv1.Verification {
+// buildVerification maps a verified row to the wire shape of its method. The
+// verification time is reported on the envelope for every method; the domain
+// arm repeats it for clients that predate the envelope field.
+func (n *namingCtrl) buildVerification(ctx context.Context, cid string, latest types.NameVerificationObject) (*namingv1.Verification, error) {
 	verifiedAt := timestamppb.New(verifiedAtOf(latest))
 
-	if latest.GetMethod() == string(naming.MethodANS) {
-		return buildAnsVerification(cid, latest, verifiedAt)
+	var verification *namingv1.Verification
+
+	switch latest.GetMethod() {
+	case string(naming.MethodANS):
+		ansVerification, err := buildAnsVerification(cid, latest)
+		if err != nil {
+			return nil, err
+		}
+
+		verification = namingv1.NewAnsVerification(ansVerification)
+	case string(naming.MethodWellKnown):
+		verification = namingv1.NewDomainVerification(&namingv1.DomainVerification{
+			Domain:     n.getDomainFromRecord(ctx, cid),
+			Method:     latest.GetMethod(),
+			KeyId:      latest.GetKeyID(),
+			VerifiedAt: verifiedAt,
+		})
+	default:
+		namingLogger.Error("Stored name verification has an unknown method", "cid", cid, "method", latest.GetMethod())
+
+		return nil, status.Errorf(codes.Internal, "verification method %q is not supported by this server", latest.GetMethod())
 	}
 
-	return namingv1.NewDomainVerification(&namingv1.DomainVerification{
-		Domain:     n.getDomainFromRecord(ctx, cid),
-		Method:     latest.GetMethod(),
-		KeyId:      latest.GetKeyID(),
-		VerifiedAt: verifiedAt,
-	})
+	verification.VerifiedAt = verifiedAt
+
+	return verification, nil
 }
 
-// buildAnsVerification decodes the stored ans details. A row whose details
-// are missing or unreadable still reports the certificate fingerprint and the
-// verification time, so a verified record is never shown as unverified.
-func buildAnsVerification(cid string, latest types.NameVerificationObject, verifiedAt *timestamppb.Timestamp) *namingv1.Verification {
-	verification := &namingv1.AnsVerification{
-		CertFingerprint: latest.GetKeyID(),
-		VerifiedAt:      verifiedAt,
-	}
-
-	details, err := ans.DecodeDetails([]byte(latest.GetDetails()))
+// buildAnsVerification decodes the stored ans details. Details that do not
+// decode are a corrupt row, not a verification this server can vouch for.
+func buildAnsVerification(cid string, latest types.NameVerificationObject) (*namingv1.AnsVerification, error) {
+	d, err := details.Decode([]byte(latest.GetDetails()))
 	if err != nil {
 		namingLogger.Error("Stored ans verification details are unreadable", "cid", cid, "error", err)
 
-		return namingv1.NewAnsVerification(verification)
+		return nil, status.Errorf(codes.Internal, "stored ans verification for %s is unreadable", cid)
 	}
 
-	verification.AnsName = details.AnsName
-	verification.AgentId = details.AgentID
-	verification.LogUrl = details.LogURL
-	verification.ReceiptUri = details.ReceiptURI
-	verification.AgentStatus = details.AgentStatus
-
-	return namingv1.NewAnsVerification(verification)
+	return &namingv1.AnsVerification{
+		AnsName:         d.AnsName,
+		AgentId:         d.AgentID,
+		AgentHost:       d.AgentHost,
+		LogUrl:          d.LogURL,
+		ReceiptUrl:      d.ReceiptURL,
+		CertFingerprint: latest.GetKeyID(),
+		AgentStatus:     d.AgentStatus,
+	}, nil
 }
 
-// verifiedAtOf is the last successful verification. Rows written before the
-// verified_at column existed fall back to updated_at, which for a verified row
-// is the time of that verdict.
+// verifiedAtOf is when the row's verdict was reached. Rows written before the
+// verified_at column existed report updated_at, which for a verified row is
+// the time of that verdict.
 func verifiedAtOf(v types.NameVerificationObject) time.Time {
 	if at := v.GetVerifiedAt(); at != nil {
 		return *at

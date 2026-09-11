@@ -5,7 +5,6 @@
 package naming
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -14,9 +13,8 @@ import (
 	"github.com/agntcy/dir/cli/presenter"
 	ctxUtils "github.com/agntcy/dir/cli/util/context"
 	"github.com/agntcy/dir/cli/util/reference"
-	"github.com/agntcy/dir/server/naming"
 	"github.com/spf13/cobra"
-	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 var verifyCmd = &cobra.Command{
@@ -127,69 +125,56 @@ func outputVerificationResult(cmd *cobra.Command, cid string, resp *namingv1.Get
 }
 
 // verificationFields flattens a verification into the fields the command prints.
-// Every arm reports cid and verified, plus domain, method, key_id, and
-// verified_at so scripts read the same keys whichever method verified the name.
-// An arm this dirctl does not know is reported verbatim rather than as
-// unverified, so an older CLI never misreports a newer server.
+// Every known arm reports cid, verified, domain, method, key_id and
+// verified_at, so scripts read the same keys whichever method verified the
+// name. An arm this dirctl does not know is still reported as verified, with
+// a message instead of details, so an older CLI never misreports a newer
+// server.
 func verificationFields(cid string, v *namingv1.Verification) map[string]any {
-	switch {
-	case v.GetDomain() != nil:
-		dv := v.GetDomain()
-
-		return map[string]any{
-			"cid":         cid,
-			"verified":    true,
-			"domain":      dv.GetDomain(),
-			"method":      dv.GetMethod(),
-			"key_id":      dv.GetKeyId(),
-			"verified_at": dv.GetVerifiedAt().AsTime().Format(time.RFC3339),
-		}
-
-	case v.GetAns() != nil:
-		av := v.GetAns()
-
-		return map[string]any{
-			"cid":              cid,
-			"verified":         true,
-			"domain":           naming.ExtractDomain(av.GetAnsName()),
-			"method":           "ans",
-			"key_id":           av.GetCertFingerprint(),
-			"verified_at":      av.GetVerifiedAt().AsTime().Format(time.RFC3339),
-			"ans_name":         av.GetAnsName(),
-			"agent_id":         av.GetAgentId(),
-			"log_url":          av.GetLogUrl(),
-			"receipt_uri":      av.GetReceiptUri(),
-			"cert_fingerprint": av.GetCertFingerprint(),
-			"agent_status":     av.GetAgentStatus(),
-		}
-
-	default:
-		return unsupportedVerificationFields(cid, v)
-	}
-}
-
-func unsupportedVerificationFields(cid string, v *namingv1.Verification) map[string]any {
 	fields := map[string]any{
 		"cid":      cid,
 		"verified": true,
-		"message":  fmt.Sprintf("unsupported verification type %T; upgrade dirctl", v.GetInfo()),
 	}
 
-	raw, err := protojson.MarshalOptions{UseProtoNames: true}.Marshal(v)
-	if err != nil {
-		fields["info"] = err.Error()
+	switch info := v.GetInfo().(type) {
+	case *namingv1.Verification_Domain:
+		dv := info.Domain
+		fields["domain"] = dv.GetDomain()
+		fields["method"] = dv.GetMethod()
+		fields["key_id"] = dv.GetKeyId()
+		fields["verified_at"] = verifiedAtOf(v, dv.GetVerifiedAt())
 
-		return fields
+	case *namingv1.Verification_Ans:
+		av := info.Ans
+		fields["domain"] = av.GetAgentHost()
+		fields["method"] = "ans"
+		fields["key_id"] = av.GetCertFingerprint()
+		fields["verified_at"] = v.GetVerifiedAt().AsTime().Format(time.RFC3339)
+		fields["ans_name"] = av.GetAnsName()
+		fields["agent_id"] = av.GetAgentId()
+		fields["agent_host"] = av.GetAgentHost()
+		fields["log_url"] = av.GetLogUrl()
+		fields["receipt_url"] = av.GetReceiptUrl()
+		fields["cert_fingerprint"] = av.GetCertFingerprint()
+		fields["agent_status"] = av.GetAgentStatus()
+
+	default:
+		fields["message"] = "the server verified this name with a method this dirctl does not know; upgrade dirctl to see the details"
+
+		if v.GetVerifiedAt() != nil {
+			fields["verified_at"] = v.GetVerifiedAt().AsTime().Format(time.RFC3339)
+		}
 	}
-
-	var info map[string]any
-	if err := json.Unmarshal(raw, &info); err != nil {
-		fields["info"] = string(raw)
-
-		return fields
-	}
-
-	fields["info"] = info
 
 	return fields
+}
+
+// verifiedAtOf prefers the envelope timestamp and falls back to the one a
+// pre-envelope server put on the domain arm.
+func verifiedAtOf(v *namingv1.Verification, arm *timestamppb.Timestamp) string {
+	if v.GetVerifiedAt() != nil {
+		return v.GetVerifiedAt().AsTime().Format(time.RFC3339)
+	}
+
+	return arm.AsTime().Format(time.RFC3339)
 }

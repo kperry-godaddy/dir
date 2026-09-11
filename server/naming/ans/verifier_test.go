@@ -30,6 +30,7 @@ import (
 	"github.com/agentnameservice/ans-sdk-go/verify/scitt"
 	"github.com/agntcy/dir/server/naming"
 	ansconfig "github.com/agntcy/dir/server/naming/ans/config"
+	"github.com/agntcy/dir/server/naming/ans/details"
 )
 
 const (
@@ -329,13 +330,13 @@ func assertLookupResult(t *testing.T, got *naming.LookupResult, err error, tt lo
 		t.Errorf("key type = %q, want %q", got.Keys[0].Type, tt.wantKeyType)
 	}
 
-	details, err := DecodeDetails(got.Details)
+	d, err := details.Decode(got.Details)
 	if err != nil {
-		t.Fatalf("DecodeDetails() error = %v", err)
+		t.Fatalf("details.Decode() error = %v", err)
 	}
 
-	if details.AgentStatus != tt.wantStatus {
-		t.Errorf("AgentStatus = %q, want %q", details.AgentStatus, tt.wantStatus)
+	if d.AgentStatus != tt.wantStatus {
+		t.Errorf("AgentStatus = %q, want %q", d.AgentStatus, tt.wantStatus)
 	}
 }
 
@@ -853,24 +854,23 @@ func TestLookupKeysResult(t *testing.T) {
 		t.Error("KeyBase64 does not encode the key DER")
 	}
 
-	details, err := DecodeDetails(got.Details)
+	d, err := details.Decode(got.Details)
 	if err != nil {
-		t.Fatalf("DecodeDetails() error = %v", err)
+		t.Fatalf("details.Decode() error = %v", err)
 	}
 
-	want := Details{
-		Version:     DetailsVersion,
+	want := details.Details{
+		Version:     details.Version,
 		AnsName:     testAnsName,
+		AgentHost:   naming.ParseName(testAnsName).Domain,
 		AgentID:     testAgentID,
 		LogURL:      testLogBase,
-		ReceiptURI:  testLogBase + "/v1/agents/" + testAgentID + "/receipt",
+		ReceiptURL:  testLogBase + "/v1/agents/" + testAgentID + "/receipt",
 		AgentStatus: "ACTIVE",
-		TreeSize:    2,
-		LeafIndex:   1,
 	}
 
-	if *details != want {
-		t.Errorf("details = %+v, want %+v", *details, want)
+	if *d != want {
+		t.Errorf("details = %+v, want %+v", *d, want)
 	}
 
 	if f.client.base != testLogBase {
@@ -1123,13 +1123,13 @@ func TestLookupKeysOverTLS(t *testing.T) {
 				t.Fatalf("LookupKeys() error = %v", err)
 			}
 
-			details, err := DecodeDetails(got.Details)
+			d, err := details.Decode(got.Details)
 			if err != nil {
-				t.Fatalf("DecodeDetails() error = %v", err)
+				t.Fatalf("details.Decode() error = %v", err)
 			}
 
-			if details.LogURL != l.server.URL {
-				t.Errorf("LogURL = %q, want %q", details.LogURL, l.server.URL)
+			if d.LogURL != l.server.URL {
+				t.Errorf("LogURL = %q, want %q", d.LogURL, l.server.URL)
 			}
 		})
 	}

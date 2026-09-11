@@ -1655,8 +1655,9 @@ Verifies that a record's signing key is authorized by the domain claimed in its 
     "verified_at": "2026-09-11T10:30:00Z",
     "ans_name": "ans://v1.0.0.agent.example.com/demo",
     "agent_id": "0f5a2a5e-6d5c-4d3e-9f6a-1b2c3d4e5f60",
+    "agent_host": "agent.example.com",
     "log_url": "https://log.ans.example.com",
-    "receipt_uri": "https://log.ans.example.com/v1/agents/0f5a2a5e-6d5c-4d3e-9f6a-1b2c3d4e5f60/receipt",
+    "receipt_url": "https://log.ans.example.com/v1/agents/0f5a2a5e-6d5c-4d3e-9f6a-1b2c3d4e5f60/receipt",
     "cert_fingerprint": "SHA256:3f1a...",
     "agent_status": "ACTIVE"
     }

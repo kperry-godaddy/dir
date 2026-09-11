@@ -12,10 +12,30 @@ import (
 	namingv1 "github.com/agntcy/dir/api/naming/v1"
 	"github.com/agntcy/dir/cli/presenter"
 	"github.com/spf13/cobra"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 const testCID = "bafyreibtestcid"
+
+// withVerifiedAt sets the envelope verification time.
+func withVerifiedAt(v *namingv1.Verification, at time.Time) *namingv1.Verification {
+	v.VerifiedAt = timestamppb.New(at)
+
+	return v
+}
+
+// withUnknownArm adds a oneof member this build does not know, the way a
+// newer server's response decodes in an older dirctl.
+func withUnknownArm(v *namingv1.Verification) *namingv1.Verification {
+	var unknown []byte
+
+	unknown = protowire.AppendTag(unknown, 9, protowire.BytesType)
+	unknown = protowire.AppendBytes(unknown, []byte("future"))
+	v.ProtoReflect().SetUnknown(unknown)
+
+	return v
+}
 
 func TestVerificationFields(t *testing.T) {
 	t.Parallel()
@@ -26,10 +46,9 @@ func TestVerificationFields(t *testing.T) {
 		name         string
 		verification *namingv1.Verification
 		want         map[string]any
-		wantInfo     bool
 	}{
 		{
-			name: "domain verification",
+			name: "domain verification from a pre-envelope server",
 			verification: namingv1.NewDomainVerification(&namingv1.DomainVerification{
 				Domain:     "cisco.com",
 				Method:     "wellknown",
@@ -46,16 +65,33 @@ func TestVerificationFields(t *testing.T) {
 			},
 		},
 		{
+			name: "domain verification prefers the envelope time",
+			verification: withVerifiedAt(namingv1.NewDomainVerification(&namingv1.DomainVerification{
+				Domain:     "cisco.com",
+				Method:     "wellknown",
+				KeyId:      "key-1",
+				VerifiedAt: timestamppb.New(verifiedAt.Add(-time.Hour)),
+			}), verifiedAt),
+			want: map[string]any{
+				"cid":         testCID,
+				"verified":    true,
+				"domain":      "cisco.com",
+				"method":      "wellknown",
+				"key_id":      "key-1",
+				"verified_at": "2026-09-11T10:30:00Z",
+			},
+		},
+		{
 			name: "ans verification",
-			verification: namingv1.NewAnsVerification(&namingv1.AnsVerification{
+			verification: withVerifiedAt(namingv1.NewAnsVerification(&namingv1.AnsVerification{
 				AnsName:         "ans://v1.0.0.agent.example.com/demo",
 				AgentId:         "0f5a2a5e-6d5c-4d3e-9f6a-1b2c3d4e5f60",
+				AgentHost:       "agent.example.com",
 				LogUrl:          "https://log.example.com",
-				ReceiptUri:      "https://log.example.com/v1/agents/0f5a2a5e-6d5c-4d3e-9f6a-1b2c3d4e5f60/receipt",
+				ReceiptUrl:      "https://log.example.com/v1/agents/0f5a2a5e-6d5c-4d3e-9f6a-1b2c3d4e5f60/receipt",
 				CertFingerprint: "SHA256:abcd",
 				AgentStatus:     "ACTIVE",
-				VerifiedAt:      timestamppb.New(verifiedAt),
-			}),
+			}), verifiedAt),
 			want: map[string]any{
 				"cid":              testCID,
 				"verified":         true,
@@ -65,33 +101,21 @@ func TestVerificationFields(t *testing.T) {
 				"verified_at":      "2026-09-11T10:30:00Z",
 				"ans_name":         "ans://v1.0.0.agent.example.com/demo",
 				"agent_id":         "0f5a2a5e-6d5c-4d3e-9f6a-1b2c3d4e5f60",
+				"agent_host":       "agent.example.com",
 				"log_url":          "https://log.example.com",
-				"receipt_uri":      "https://log.example.com/v1/agents/0f5a2a5e-6d5c-4d3e-9f6a-1b2c3d4e5f60/receipt",
+				"receipt_url":      "https://log.example.com/v1/agents/0f5a2a5e-6d5c-4d3e-9f6a-1b2c3d4e5f60/receipt",
 				"cert_fingerprint": "SHA256:abcd",
 				"agent_status":     "ACTIVE",
 			},
 		},
 		{
-			name: "ans verification with unparseable name",
-			verification: namingv1.NewAnsVerification(&namingv1.AnsVerification{
-				AnsName:         "ans://not-a-versioned-host",
-				CertFingerprint: "SHA256:abcd",
-				AgentStatus:     "WARNING",
-				VerifiedAt:      timestamppb.New(verifiedAt),
-			}),
+			name:         "unknown arm",
+			verification: withVerifiedAt(withUnknownArm(&namingv1.Verification{}), verifiedAt),
 			want: map[string]any{
-				"cid":              testCID,
-				"verified":         true,
-				"domain":           "",
-				"method":           "ans",
-				"key_id":           "SHA256:abcd",
-				"verified_at":      "2026-09-11T10:30:00Z",
-				"ans_name":         "ans://not-a-versioned-host",
-				"agent_id":         "",
-				"log_url":          "",
-				"receipt_uri":      "",
-				"cert_fingerprint": "SHA256:abcd",
-				"agent_status":     "WARNING",
+				"cid":         testCID,
+				"verified":    true,
+				"message":     "the server verified this name with a method this dirctl does not know; upgrade dirctl to see the details",
+				"verified_at": "2026-09-11T10:30:00Z",
 			},
 		},
 		{
@@ -100,9 +124,8 @@ func TestVerificationFields(t *testing.T) {
 			want: map[string]any{
 				"cid":      testCID,
 				"verified": true,
-				"message":  "unsupported verification type <nil>; upgrade dirctl",
+				"message":  "the server verified this name with a method this dirctl does not know; upgrade dirctl to see the details",
 			},
-			wantInfo: true,
 		},
 		{
 			name:         "nil verification",
@@ -110,19 +133,20 @@ func TestVerificationFields(t *testing.T) {
 			want: map[string]any{
 				"cid":      testCID,
 				"verified": true,
-				"message":  "unsupported verification type <nil>; upgrade dirctl",
+				"message":  "the server verified this name with a method this dirctl does not know; upgrade dirctl to see the details",
 			},
-			wantInfo: true,
 		},
 		{
-			name:         "empty arm",
+			name:         "domain arm without payload",
 			verification: &namingv1.Verification{Info: &namingv1.Verification_Domain{}},
 			want: map[string]any{
-				"cid":      testCID,
-				"verified": true,
-				"message":  "unsupported verification type *v1.Verification_Domain; upgrade dirctl",
+				"cid":         testCID,
+				"verified":    true,
+				"domain":      "",
+				"method":      "",
+				"key_id":      "",
+				"verified_at": "1970-01-01T00:00:00Z",
 			},
-			wantInfo: true,
 		},
 	}
 
@@ -138,17 +162,8 @@ func TestVerificationFields(t *testing.T) {
 				}
 			}
 
-			if _, hasInfo := got["info"]; hasInfo != tt.wantInfo {
-				t.Errorf("info present = %v, want %v (fields %v)", hasInfo, tt.wantInfo, got)
-			}
-
-			wantLen := len(tt.want)
-			if tt.wantInfo {
-				wantLen++
-			}
-
-			if len(got) != wantLen {
-				t.Errorf("got %d fields %v, want %d", len(got), got, wantLen)
+			if len(got) != len(tt.want) {
+				t.Errorf("got %d fields %v, want %d", len(got), got, len(tt.want))
 			}
 		})
 	}
@@ -166,13 +181,13 @@ func TestOutputVerificationResultJSON(t *testing.T) {
 			name: "ans verification",
 			response: &namingv1.GetVerificationInfoResponse{
 				Verified: true,
-				Verification: namingv1.NewAnsVerification(&namingv1.AnsVerification{
+				Verification: withVerifiedAt(namingv1.NewAnsVerification(&namingv1.AnsVerification{
 					AnsName:         "ans://v1.0.0.agent.example.com",
 					AgentId:         "agent-1",
+					AgentHost:       "agent.example.com",
 					CertFingerprint: "SHA256:abcd",
 					AgentStatus:     "ACTIVE",
-					VerifiedAt:      timestamppb.New(time.Date(2026, time.September, 11, 10, 30, 0, 0, time.UTC)),
-				}),
+				}), time.Date(2026, time.September, 11, 10, 30, 0, 0, time.UTC)),
 			},
 			want: map[string]any{
 				"cid":          testCID,

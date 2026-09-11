@@ -115,7 +115,7 @@ func (t *Task) verifyRecord(ctx context.Context, cid, recordName string) outcome
 		return t.recordResult(cid, recordName, &naming.Result{Error: "could not parse record name"}, started)
 	}
 
-	if !t.provider.Supports(parsed.Protocol) {
+	if t.provider.Method(parsed.Protocol) == naming.MethodNone {
 		logger.Debug("Skipping record: no verification method for its protocol", "cid", cid, "protocol", parsed.Protocol)
 
 		return outcome{kind: outcomeSkipped, protocol: parsed.Protocol}

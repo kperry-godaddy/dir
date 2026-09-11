@@ -13,6 +13,24 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
+// IsKeyBased reports whether the signature was made with a key rather than
+// through Sigstore's keyless flow, which stores its material in
+// content_bundle.
+func (s *Signature) IsKeyBased() bool {
+	return s.GetContentBundle() == ""
+}
+
+// KeyCertificate returns the certificate attached to a key-based signature
+// (base64 DER) and whether there is one. Keyless signatures carry their
+// certificate inside content_bundle and report none here.
+func (s *Signature) KeyCertificate() (string, bool) {
+	if !s.IsKeyBased() || s.GetCertificate() == "" {
+		return "", false
+	}
+
+	return s.GetCertificate(), true
+}
+
 // ReferrerType returns the type for Signature.
 func (s *Signature) ReferrerType() string {
 	return string((&Signature{}).ProtoReflect().Descriptor().FullName())

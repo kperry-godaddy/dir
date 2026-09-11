@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -195,24 +197,24 @@ func TestProviderVerifyUnconfigured(t *testing.T) {
 			name:       "unparseable name",
 			options:    []ProviderOption{WithWellKnownLookup(&fakeSchemeLookup{})},
 			recordName: "invalid",
-			want:       want{err: "could not parse record name"},
+			want:       want{method: "none", err: "could not parse record name"},
 		},
 		{
 			name:       "name without protocol selects no method",
 			options:    []ProviderOption{WithWellKnownLookup(&fakeSchemeLookup{})},
 			recordName: "example.org/agent",
-			want:       want{method: "none", err: "no verification protocol specified in name (use https://, http:// or ans:// prefix)"},
+			want:       want{method: "none", err: "name has no protocol prefix"},
 		},
 		{
 			name:       "https name without well-known lookup",
 			recordName: "https://example.org/agent",
-			want:       want{method: "none", err: "JWKS verification not configured"},
+			want:       want{method: "none", err: `no verification method registered for protocol "https://"`},
 		},
 		{
 			name:       "ans name without ans lookup",
 			options:    []ProviderOption{WithWellKnownLookup(&fakeSchemeLookup{})},
 			recordName: "ans://v1.0.0.agent.example.com",
-			want:       want{method: "none", err: "ANS verification not configured (reconciler name.ans.enabled / daemon reconciler.name.ans.enabled)"},
+			want:       want{method: "none", err: `no verification method registered for protocol "ans://"`},
 		},
 	}
 
@@ -351,29 +353,119 @@ func TestWithLookupOverridesWellKnown(t *testing.T) {
 	}
 }
 
-func TestProviderSupports(t *testing.T) {
-	provider := NewProvider(WithWellKnownLookup(&fakeSchemeLookup{}))
+func TestProviderMethod(t *testing.T) {
+	provider := NewProvider(
+		WithWellKnownLookup(&fakeSchemeLookup{}),
+		WithLookup(ANSProtocol, &fakeMethodLookup{method: MethodANS}),
+	)
 
 	tests := []struct {
+		name     string
 		protocol string
-		want     bool
+		want     VerificationMethod
 	}{
-		{protocol: HTTPSProtocol, want: true},
-		{protocol: HTTPProtocol, want: true},
-		{protocol: ANSProtocol, want: false},
-		{protocol: "", want: false},
+		{name: "https", protocol: HTTPSProtocol, want: MethodWellKnown},
+		{name: "http", protocol: HTTPProtocol, want: MethodWellKnown},
+		{name: "ans", protocol: ANSProtocol, want: MethodANS},
+		{name: "empty", protocol: "", want: MethodNone},
+		{name: "unregistered", protocol: "did://", want: MethodNone},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.protocol, func(t *testing.T) {
-			if got := provider.Supports(tt.protocol); got != tt.want {
-				t.Errorf("Supports(%q) = %v, want %v", tt.protocol, got, tt.want)
+		t.Run(tt.name, func(t *testing.T) {
+			if got := provider.Method(tt.protocol); got != tt.want {
+				t.Errorf("Method(%q) = %q, want %q", tt.protocol, got, tt.want)
 			}
 		})
 	}
 
-	if !NewProvider(WithLookup(ANSProtocol, &fakeMethodLookup{method: MethodANS})).Supports(ANSProtocol) {
-		t.Error("Supports(ANSProtocol) = false after WithLookup, want true")
+	if got := NewProvider().Method(HTTPSProtocol); got != MethodNone {
+		t.Errorf("Method(https) on an empty provider = %q, want %q", got, MethodNone)
+	}
+}
+
+func TestWithLookupRejectsUnknownPrefix(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("WithLookup accepted a prefix ParseName cannot route")
+		}
+	}()
+
+	WithLookup("did://", &fakeMethodLookup{method: "did"})
+}
+
+func TestNilLookupsRegisterNothing(t *testing.T) {
+	provider := NewProvider(WithWellKnownLookup(nil), WithLookup(ANSProtocol, nil))
+
+	for _, protocol := range VerifiablePrefixes() {
+		if got := provider.Method(protocol); got != MethodNone {
+			t.Errorf("Method(%q) = %q after nil registrations, want %q", protocol, got, MethodNone)
+		}
+	}
+
+	got := provider.Verify(context.Background(), "https://example.org/agent", []Signer{{Key: keyA}})
+	assertResult(t, got, want{method: "none", err: `no verification method registered for protocol "https://"`})
+}
+
+func TestProviderVerifyGuardsLookupContract(t *testing.T) {
+	tests := []struct {
+		name    string
+		lookup  *fakeMethodLookup
+		signers []Signer
+		want    want
+	}{
+		{
+			name:    "nil result with nil error is no keys",
+			lookup:  &fakeMethodLookup{method: MethodANS},
+			signers: []Signer{{Key: keyA, Certificate: certA}},
+			want:    want{method: "ans", err: "no keys found for domain"},
+		},
+		{
+			name:    "empty signer key never matches an empty published key",
+			lookup:  &fakeMethodLookup{method: MethodANS, result: &LookupResult{Keys: []PublicKey{{ID: "empty"}}}},
+			signers: []Signer{{Certificate: certA}},
+			want:    want{method: "ans", err: "signing key does not match any domain key"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := NewProvider(WithLookup(ANSProtocol, tt.lookup))
+
+			got := provider.Verify(context.Background(), "ans://v1.0.0.agent.example.com", tt.signers)
+
+			assertResult(t, got, tt.want)
+		})
+	}
+}
+
+func TestWellKnownLookupClassifiesNetworkFailures(t *testing.T) {
+	tests := []struct {
+		name          string
+		err           error
+		wantTransient bool
+	}{
+		{name: "url error", err: &url.Error{Op: "Get", URL: "https://example.org/.well-known/jwks.json", Err: errors.New("connection refused")}, wantTransient: true},
+		{name: "deadline", err: fmt.Errorf("fetch: %w", context.DeadlineExceeded), wantTransient: true},
+		{name: "canceled", err: context.Canceled, wantTransient: true},
+		{name: "net error", err: &net.DNSError{Err: "no such host", Name: "example.org", IsNotFound: true}, wantTransient: true},
+		{name: "malformed key set", err: errors.New("failed to parse JWK set"), wantTransient: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			provider := NewProvider(WithWellKnownLookup(&fakeSchemeLookup{err: tt.err}))
+
+			got := provider.Verify(context.Background(), "https://example.org/agent", []Signer{{Key: keyA}})
+
+			if got.Verified {
+				t.Fatal("Verify() = verified on a failed lookup")
+			}
+
+			if got.Transient != tt.wantTransient {
+				t.Errorf("Transient = %v, want %v (error %q)", got.Transient, tt.wantTransient, got.Error)
+			}
+		})
 	}
 }
 

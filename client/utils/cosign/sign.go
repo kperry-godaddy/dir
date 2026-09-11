@@ -30,6 +30,11 @@ const (
 	DefaultFulcioTimeout             = 30 * time.Second
 	DefaultTimestampAuthorityTimeout = 30 * time.Second
 	DefaultRekorTimeout              = 90 * time.Second
+
+	// MaxCertificateDERSize bounds a certificate attached to a key-based
+	// signature. Identity certificates are a few kilobytes; verifiers drop
+	// anything larger without decoding it.
+	MaxCertificateDERSize = 16 << 10
 )
 
 // SignBlobWithOIDC signs a blob using OIDC authentication.

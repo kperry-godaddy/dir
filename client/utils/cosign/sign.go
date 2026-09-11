@@ -88,8 +88,9 @@ func SignBlobWithOIDC(ctx context.Context, payload []byte, req *signv1.SignWithO
 // SignBlobWithKey signs a blob using a private key.
 // Supports both inline PEM content and key references (file paths, URLs, KMS URIs).
 // When the request carries a certificate bundle, the certificate whose public
-// key matches the signing key is attached to the signature; the match is
-// checked before signing so a mismatch never invokes the signer.
+// key matches the signing key is attached to the signature; the match and the
+// size bound are checked before signing so a rejected certificate never
+// invokes the signer.
 func SignBlobWithKey(ctx context.Context, payload []byte, req *signv1.SignWithKey) (*signv1.Signature, *signv1.PublicKey, error) {
 	sv, err := loadSignerVerifier(ctx, req)
 	if err != nil {
@@ -101,12 +102,18 @@ func SignBlobWithKey(ctx context.Context, payload []byte, req *signv1.SignWithKe
 		return nil, nil, fmt.Errorf("getting public key: %w", err)
 	}
 
+	signingTime := time.Now()
+
 	var certificate string
 
 	if bundle := req.GetCertificate(); bundle != "" {
-		cert, err := selectCertificateForKey([]byte(bundle), pubKey)
+		cert, err := selectCertificateForKey([]byte(bundle), pubKey, signingTime)
 		if err != nil {
 			return nil, nil, fmt.Errorf("selecting certificate: %w", err)
+		}
+
+		if len(cert.Raw) > MaxCertificateDERSize {
+			return nil, nil, fmt.Errorf("certificate is %d bytes of DER; verifiers accept at most %d bytes", len(cert.Raw), MaxCertificateDERSize)
 		}
 
 		certificate = base64.StdEncoding.EncodeToString(cert.Raw)
@@ -123,7 +130,7 @@ func SignBlobWithKey(ctx context.Context, payload []byte, req *signv1.SignWithKe
 	}
 
 	sigResult := &signv1.Signature{
-		SignedAt:    time.Now().UTC().Format(time.RFC3339),
+		SignedAt:    signingTime.UTC().Format(time.RFC3339),
 		Signature:   base64.StdEncoding.EncodeToString(sig),
 		Algorithm:   detectKeyAlgorithm(string(publicKeyPEM)),
 		Certificate: certificate,
@@ -135,20 +142,24 @@ func SignBlobWithKey(ctx context.Context, payload []byte, req *signv1.SignWithKe
 	return sigResult, publicKey, nil
 }
 
-// loadSignerVerifier loads the request's private key, first as inline PEM and
-// then as a key reference (file path, URL, KMS URI, etc.).
+// loadSignerVerifier loads the request's private key: inline PEM is decoded
+// in place, anything else is a key reference (file path, URL, KMS URI, etc.).
 func loadSignerVerifier(ctx context.Context, req *signv1.SignWithKey) (signature.SignerVerifier, error) {
 	privateKey := req.GetPrivateKey()
 	if privateKey == "" {
 		return nil, errors.New("private_key is required")
 	}
 
-	sv, err := cosign.LoadPrivateKey([]byte(privateKey), req.GetPassword(), nil)
-	if err == nil {
+	if strings.HasPrefix(strings.TrimSpace(privateKey), "-----BEGIN") {
+		sv, err := cosign.LoadPrivateKey([]byte(privateKey), req.GetPassword(), nil)
+		if err != nil {
+			return nil, fmt.Errorf("loading inline private key: %w", err)
+		}
+
 		return sv, nil
 	}
 
-	sv, err = csignature.SignerVerifierFromKeyRef(ctx, privateKey, func(_ bool) ([]byte, error) {
+	sv, err := csignature.SignerVerifierFromKeyRef(ctx, privateKey, func(_ bool) ([]byte, error) {
 		return req.GetPassword(), nil
 	}, nil)
 	if err != nil {
@@ -158,28 +169,44 @@ func loadSignerVerifier(ctx context.Context, req *signv1.SignWithKey) (signature
 	return sv, nil
 }
 
-// selectCertificateForKey returns the first certificate in the PEM bundle whose
-// public key equals signer. The bundle may hold a single certificate or a chain;
-// it must not contain private keys.
-func selectCertificateForKey(pemBundle []byte, signer crypto.PublicKey) (*x509.Certificate, error) {
-	certs, err := parseCertificateBundle(pemBundle)
+// selectCertificateForKey returns the certificate in the PEM bundle whose
+// public key equals signer, preferring one valid at now. When no match is
+// valid the first match is returned, so a renewed certificate wins over the
+// one it replaced and an expired-only bundle still names the certificate the
+// verifier will reject. The bundle may hold a single certificate or a chain.
+func selectCertificateForKey(pemBundle []byte, signer crypto.PublicKey, now time.Time) (*x509.Certificate, error) {
+	certs, err := ParseCertificateBundle(pemBundle)
 	if err != nil {
 		return nil, err
 	}
 
+	var first *x509.Certificate
+
 	for _, cert := range certs {
-		if cryptoutils.EqualKeys(signer, cert.PublicKey) == nil {
+		if cryptoutils.EqualKeys(signer, cert.PublicKey) != nil {
+			continue
+		}
+
+		if !now.Before(cert.NotBefore) && !now.After(cert.NotAfter) {
 			return cert, nil
+		}
+
+		if first == nil {
+			first = cert
 		}
 	}
 
-	return nil, fmt.Errorf("none of the %d certificates match the signing key", len(certs))
+	if first == nil {
+		return nil, fmt.Errorf("none of the %d certificates match the signing key", len(certs))
+	}
+
+	return first, nil
 }
 
-// parseCertificateBundle parses every CERTIFICATE block in the PEM bundle. Blocks
-// of other types are ignored, except private keys, which are rejected so a key
-// file passed by mistake is never sent on as a certificate.
-func parseCertificateBundle(pemBundle []byte) ([]*x509.Certificate, error) {
+// ParseCertificateBundle parses every CERTIFICATE block in the PEM bundle.
+// Blocks of other types are ignored, except private keys, which are rejected
+// so a key file passed by mistake is never sent on as a certificate.
+func ParseCertificateBundle(pemBundle []byte) ([]*x509.Certificate, error) {
 	var certs []*x509.Certificate
 
 	for rest := pemBundle; ; {
@@ -191,7 +218,7 @@ func parseCertificateBundle(pemBundle []byte) ([]*x509.Certificate, error) {
 		}
 
 		if strings.Contains(block.Type, "PRIVATE KEY") {
-			return nil, errors.New("certificate file contains a private key block; pass only certificates")
+			return nil, errors.New("certificate contains a private key block; pass only certificates")
 		}
 
 		if block.Type != "CERTIFICATE" {

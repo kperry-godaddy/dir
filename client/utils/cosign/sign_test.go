@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/base64"
 	"encoding/pem"
 	"math/big"
@@ -35,19 +36,19 @@ func newTestKey(t *testing.T) *ecdsa.PrivateKey {
 	return key
 }
 
-// newSelfSignedCert issues a self-signed identity certificate for key naming
-// the agent ans://v1.0.0.agent.example.com in its URI SAN.
-func newSelfSignedCert(t *testing.T, key *ecdsa.PrivateKey) *x509.Certificate {
+// issueCertificate self-signs an identity certificate for key naming the agent
+// ans://v1.0.0.agent.example.com in its URI SAN.
+func issueCertificate(t *testing.T, key *ecdsa.PrivateKey, notBefore, notAfter time.Time, extensions ...pkix.Extension) *x509.Certificate {
 	t.Helper()
 
-	now := time.Now()
 	template := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "agent.example.com"},
-		NotBefore:    now.Add(-time.Hour),
-		NotAfter:     now.Add(24 * time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-		URIs:         []*url.URL{{Scheme: "ans", Host: "v1.0.0.agent.example.com"}},
+		SerialNumber:    big.NewInt(1),
+		Subject:         pkix.Name{CommonName: "agent.example.com"},
+		NotBefore:       notBefore,
+		NotAfter:        notAfter,
+		KeyUsage:        x509.KeyUsageDigitalSignature,
+		URIs:            []*url.URL{{Scheme: "ans", Host: "v1.0.0.agent.example.com"}},
+		ExtraExtensions: extensions,
 	}
 
 	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
@@ -57,6 +58,27 @@ func newSelfSignedCert(t *testing.T, key *ecdsa.PrivateKey) *x509.Certificate {
 	require.NoError(t, err)
 
 	return cert
+}
+
+func newSelfSignedCert(t *testing.T, key *ecdsa.PrivateKey) *x509.Certificate {
+	t.Helper()
+
+	now := time.Now()
+
+	return issueCertificate(t, key, now.Add(-time.Hour), now.Add(24*time.Hour))
+}
+
+// newOversizedCert issues a certificate whose DER exceeds MaxCertificateDERSize.
+func newOversizedCert(t *testing.T, key *ecdsa.PrivateKey) *x509.Certificate {
+	t.Helper()
+
+	now := time.Now()
+	padding := pkix.Extension{
+		Id:    asn1.ObjectIdentifier{1, 3, 6, 1, 4, 1, 55555, 1},
+		Value: make([]byte, MaxCertificateDERSize),
+	}
+
+	return issueCertificate(t, key, now.Add(-time.Hour), now.Add(24*time.Hour), padding)
 }
 
 func certificatePEM(cert *x509.Certificate) []byte {
@@ -97,34 +119,42 @@ func importCosignKey(t *testing.T, key *ecdsa.PrivateKey) string {
 	return string(keys.PrivateBytes)
 }
 
-func TestSelectCertificateForKey(t *testing.T) {
+func writeKeyFile(t *testing.T, encryptedKey string) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "import-cosign.key")
+	require.NoError(t, os.WriteFile(path, []byte(encryptedKey), 0o600))
+
+	return path
+}
+
+func TestParseCertificateBundle(t *testing.T) {
 	t.Parallel()
 
 	signer := newTestKey(t)
-	other := newTestKey(t)
 	leaf := newSelfSignedCert(t, signer)
-	otherCert := newSelfSignedCert(t, other)
+	issuer := newSelfSignedCert(t, newTestKey(t))
 
 	tests := []struct {
 		name    string
 		bundle  []byte
-		wantRaw []byte
+		wantRaw [][]byte
 		wantErr string
 	}{
 		{
-			name:    "matching certificate",
+			name:    "single certificate",
 			bundle:  certificatePEM(leaf),
-			wantRaw: leaf.Raw,
+			wantRaw: [][]byte{leaf.Raw},
 		},
 		{
-			name:    "mismatched certificate",
-			bundle:  certificatePEM(otherCert),
-			wantErr: "none of the 1 certificates match the signing key",
+			name:    "chain keeps order",
+			bundle:  append(certificatePEM(leaf), certificatePEM(issuer)...),
+			wantRaw: [][]byte{leaf.Raw, issuer.Raw},
 		},
 		{
-			name:    "chain with leaf last",
-			bundle:  append(certificatePEM(otherCert), certificatePEM(leaf)...),
-			wantRaw: leaf.Raw,
+			name:    "skips blocks of other types",
+			bundle:  append(publicKeyPEM(t, signer), certificatePEM(leaf)...),
+			wantRaw: [][]byte{leaf.Raw},
 		},
 		{
 			name:    "public key block only",
@@ -139,7 +169,7 @@ func TestSelectCertificateForKey(t *testing.T) {
 		{
 			name:    "private key block",
 			bundle:  append(certificatePEM(leaf), privateKeyPEM(t, signer)...),
-			wantErr: "contains a private key block",
+			wantErr: "certificate contains a private key block",
 		},
 		{
 			name:    "malformed certificate",
@@ -152,7 +182,77 @@ func TestSelectCertificateForKey(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			cert, err := selectCertificateForKey(tt.bundle, &signer.PublicKey)
+			certs, err := ParseCertificateBundle(tt.bundle)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				require.Nil(t, certs)
+
+				return
+			}
+
+			require.NoError(t, err)
+			require.Len(t, certs, len(tt.wantRaw))
+
+			for i, cert := range certs {
+				require.Equal(t, tt.wantRaw[i], cert.Raw)
+			}
+		})
+	}
+}
+
+func TestSelectCertificateForKey(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, time.September, 11, 12, 0, 0, 0, time.UTC)
+	signer := newTestKey(t)
+	current := issueCertificate(t, signer, now.Add(-time.Hour), now.Add(time.Hour))
+	expired := issueCertificate(t, signer, now.Add(-48*time.Hour), now.Add(-24*time.Hour))
+	future := issueCertificate(t, signer, now.Add(24*time.Hour), now.Add(48*time.Hour))
+	other := newSelfSignedCert(t, newTestKey(t))
+
+	tests := []struct {
+		name    string
+		bundle  []byte
+		wantRaw []byte
+		wantErr string
+	}{
+		{
+			name:    "matching certificate",
+			bundle:  certificatePEM(current),
+			wantRaw: current.Raw,
+		},
+		{
+			name:    "mismatched certificate",
+			bundle:  certificatePEM(other),
+			wantErr: "none of the 1 certificates match the signing key",
+		},
+		{
+			name:    "chain with leaf last",
+			bundle:  append(certificatePEM(other), certificatePEM(current)...),
+			wantRaw: current.Raw,
+		},
+		{
+			name:    "prefers the currently valid match",
+			bundle:  append(certificatePEM(expired), certificatePEM(current)...),
+			wantRaw: current.Raw,
+		},
+		{
+			name:    "falls back to the first match when none is valid",
+			bundle:  append(certificatePEM(expired), certificatePEM(future)...),
+			wantRaw: expired.Raw,
+		},
+		{
+			name:    "unparsable bundle",
+			bundle:  publicKeyPEM(t, signer),
+			wantErr: "no CERTIFICATE PEM block found",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			cert, err := selectCertificateForKey(tt.bundle, &signer.PublicKey, now)
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
 				require.Nil(t, cert)
@@ -166,80 +266,110 @@ func TestSelectCertificateForKey(t *testing.T) {
 	}
 }
 
-func TestSignBlobWithKeyAttachesMatchingCertificate(t *testing.T) {
+func TestSignBlobWithKey(t *testing.T) {
 	t.Parallel()
 
 	signer := newTestKey(t)
 	leaf := newSelfSignedCert(t, signer)
-	payload := []byte("bafyreib-record-cid")
+	encryptedKey := importCosignKey(t, signer)
+	password := []byte(testKeyPassword)
 
-	sig, pub, err := SignBlobWithKey(t.Context(), payload, &signv1.SignWithKey{
-		PrivateKey:  importCosignKey(t, signer),
-		Password:    []byte(testKeyPassword),
-		Certificate: new(string(certificatePEM(leaf))),
-	})
-	require.NoError(t, err)
+	tests := []struct {
+		name            string
+		request         *signv1.SignWithKey
+		wantCertificate bool
+		wantErr         string
+	}{
+		{
+			name: "attaches the matching certificate",
+			request: &signv1.SignWithKey{
+				PrivateKey:  encryptedKey,
+				Password:    password,
+				Certificate: new(string(certificatePEM(leaf))),
+			},
+			wantCertificate: true,
+		},
+		{
+			name:    "signs without a certificate",
+			request: &signv1.SignWithKey{PrivateKey: encryptedKey, Password: password},
+		},
+		{
+			name:    "loads the key from a file reference",
+			request: &signv1.SignWithKey{PrivateKey: writeKeyFile(t, encryptedKey), Password: password},
+		},
+		{
+			name: "rejects a mismatched certificate",
+			request: &signv1.SignWithKey{
+				PrivateKey:  encryptedKey,
+				Password:    password,
+				Certificate: new(string(certificatePEM(newSelfSignedCert(t, newTestKey(t))))),
+			},
+			wantErr: "none of the 1 certificates match the signing key",
+		},
+		{
+			name: "rejects an oversized certificate",
+			request: &signv1.SignWithKey{
+				PrivateKey:  encryptedKey,
+				Password:    password,
+				Certificate: new(string(certificatePEM(newOversizedCert(t, signer)))),
+			},
+			wantErr: "verifiers accept at most 16384 bytes",
+		},
+		{
+			name:    "requires a private key",
+			request: &signv1.SignWithKey{},
+			wantErr: "private_key is required",
+		},
+		{
+			name:    "rejects an unloadable key reference",
+			request: &signv1.SignWithKey{PrivateKey: filepath.Join(t.TempDir(), "missing.key")},
+			wantErr: "loading private key from reference",
+		},
+		{
+			name:    "rejects an inline key with the wrong password",
+			request: &signv1.SignWithKey{PrivateKey: encryptedKey, Password: []byte("wrong")},
+			wantErr: "loading inline private key: decrypt",
+		},
+		{
+			name:    "rejects an inline key that is not in the cosign format",
+			request: &signv1.SignWithKey{PrivateKey: string(privateKeyPEM(t, signer))},
+			wantErr: "loading inline private key: unsupported pem type: PRIVATE KEY",
+		},
+	}
 
-	require.Equal(t, base64.StdEncoding.EncodeToString(leaf.Raw), sig.GetCertificate())
-	require.Empty(t, sig.GetContentBundle())
-	require.NotEmpty(t, sig.GetAlgorithm())
-	require.NotEmpty(t, sig.GetSignedAt())
-	require.Contains(t, pub.GetKey(), "PUBLIC KEY")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	rawSig, err := base64.StdEncoding.DecodeString(sig.GetSignature())
-	require.NoError(t, err)
+			payload := []byte("bafyreib-record-cid")
 
-	digest := sha256.Sum256(payload)
-	require.True(t, ecdsa.VerifyASN1(&signer.PublicKey, digest[:], rawSig), "signature must verify with the certificate key")
-}
+			sig, pub, err := SignBlobWithKey(t.Context(), payload, tt.request)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				require.NotContains(t, err.Error(), "-----BEGIN", "errors must not echo key material")
+				require.Nil(t, sig)
+				require.Nil(t, pub)
 
-func TestSignBlobWithKeyWithoutCertificate(t *testing.T) {
-	t.Parallel()
+				return
+			}
 
-	signer := newTestKey(t)
+			require.NoError(t, err)
+			require.Empty(t, sig.GetContentBundle())
+			require.NotEmpty(t, sig.GetAlgorithm())
+			require.NotEmpty(t, sig.GetSignedAt())
+			require.Contains(t, pub.GetKey(), "PUBLIC KEY")
 
-	sig, pub, err := SignBlobWithKey(t.Context(), []byte("payload"), &signv1.SignWithKey{
-		PrivateKey: importCosignKey(t, signer),
-		Password:   []byte(testKeyPassword),
-	})
-	require.NoError(t, err)
-	require.Empty(t, sig.GetCertificate())
-	require.NotEmpty(t, sig.GetSignature())
-	require.NotEmpty(t, pub.GetKey())
-}
+			if tt.wantCertificate {
+				require.Equal(t, base64.StdEncoding.EncodeToString(leaf.Raw), sig.GetCertificate())
+			} else {
+				require.Empty(t, sig.GetCertificate())
+			}
 
-func TestSignBlobWithKeyRejectsMismatchedCertificate(t *testing.T) {
-	t.Parallel()
+			rawSig, err := base64.StdEncoding.DecodeString(sig.GetSignature())
+			require.NoError(t, err)
 
-	signer := newTestKey(t)
-	otherCert := newSelfSignedCert(t, newTestKey(t))
-
-	sig, pub, err := SignBlobWithKey(t.Context(), []byte("payload"), &signv1.SignWithKey{
-		PrivateKey:  importCosignKey(t, signer),
-		Password:    []byte(testKeyPassword),
-		Certificate: new(string(certificatePEM(otherCert))),
-	})
-	require.ErrorContains(t, err, "none of the 1 certificates match the signing key")
-	require.Nil(t, sig)
-	require.Nil(t, pub)
-}
-
-func TestSignBlobWithKeyRequiresPrivateKey(t *testing.T) {
-	t.Parallel()
-
-	sig, pub, err := SignBlobWithKey(t.Context(), []byte("payload"), &signv1.SignWithKey{})
-	require.ErrorContains(t, err, "private_key is required")
-	require.Nil(t, sig)
-	require.Nil(t, pub)
-}
-
-func TestSignBlobWithKeyRejectsUnloadableKeyReference(t *testing.T) {
-	t.Parallel()
-
-	sig, pub, err := SignBlobWithKey(t.Context(), []byte("payload"), &signv1.SignWithKey{
-		PrivateKey: filepath.Join(t.TempDir(), "missing.key"),
-	})
-	require.ErrorContains(t, err, "loading private key from reference")
-	require.Nil(t, sig)
-	require.Nil(t, pub)
+			digest := sha256.Sum256(payload)
+			require.True(t, ecdsa.VerifyASN1(&signer.PublicKey, digest[:], rawSig), "signature must verify with the signing key")
+		})
+	}
 }

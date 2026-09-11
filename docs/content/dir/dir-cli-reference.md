@@ -655,6 +655,9 @@ Stores records in the content-addressable store. Has the following features:
 
     # Push with signature
     dirctl push agent-model.json --sign --key private.key
+
+    # Push an ans:// record signed with the ANS identity key and certificate
+    dirctl push agent-model.json --sign --key import-cosign.key --certificate identity-cert.pem
     ```
 
 ### `dirctl pull <reference>`
@@ -831,6 +834,7 @@ Fetch and import records from registries or local sources.
 | `--force` | - | Force reimport of existing records (skip deduplication) | No | false |
 | `--sign` | - | Sign records after pushing (uses OIDC by default) | No | false |
 | `--key` | - | Path to private key file for signing (requires `--sign`) | No | - |
+| `--certificate` | - | PEM file with the X.509 certificate, or chain, for `--key`; only the certificate matching the key is attached (requires `--key`) | No | - |
 | `--oidc-token` | - | OIDC token for non-interactive signing (requires `--sign`) | No | - |
 | `--fulcio-url` | - | Sigstore Fulcio URL (requires `--sign`) | No | `https://fulcio.sigstore.dev` |
 | `--rekor-url` | - | Sigstore Rekor URL (requires `--sign`) | No | `https://rekor.sigstore.dev` |
@@ -897,6 +901,13 @@ Fetch and import records from registries or local sources.
       --url=https://registry.modelcontextprotocol.io/v0.1 \
       --sign \
       --key=/path/to/cosign.key
+
+    # Import and sign ans:// records with the ANS identity key and certificate
+    dirctl import --type=mcp \
+      --file-path=./ans-agents.json \
+      --sign \
+      --key=import-cosign.key \
+      --certificate=identity-cert.pem
 
     ```
 
@@ -1047,6 +1058,9 @@ dirctl import --type=mcp-registry --url=https://registry.modelcontextprotocol.io
 
 # Sign with a private key
 dirctl import --type=mcp-registry --url=https://registry.modelcontextprotocol.io/v0.1 --sign --key=/path/to/cosign.key
+
+# Sign ans:// records with the ANS identity key and certificate
+dirctl import --type=mcp --file-path=./ans-agents.json --sign --key=import-cosign.key --certificate=identity-cert.pem
 ```
 
 ## Export Operations
@@ -1496,9 +1510,9 @@ Record name verification proves that the signing key is authorized by the domain
 
 **Requirements:**
 
-- Record name must include a protocol prefix: `https://domain/path` or `http://domain/path`
-- A JWKS file must be hosted at `<scheme>://<domain>/.well-known/jwks.json`
-- The record must be signed with the private key corresponding to a public key present in that JWKS file
+- Record name must include a protocol prefix that selects the method: `https://domain/path`, `http://domain/path`, or `ans://vX.Y.Z.host[/path]`
+- JWKS method (`https://`, `http://`): a JWKS file must be hosted at `<scheme>://<domain>/.well-known/jwks.json`, and the record must be signed with the private key corresponding to a public key present in that JWKS file
+- ANS method (`ans://`): the record must be signed with the agent's ANS identity key using key-based signing with `--certificate <identity-cert.pem>`; the reconciler checks the certificate against the agent's `_ans-badge` DNS record and its transparency log, and the method must be enabled on the reconciler (`name.ans.enabled`). OIDC signatures cannot verify an `ans://` name.
 
 **Workflow:**
 
@@ -1512,7 +1526,11 @@ Record name verification proves that the signing key is authorized by the domain
 2. Sign the record (triggers automatic verification).
 
     ```bash
+    # JWKS method
     dirctl sign <cid> --key private.key
+
+    # ANS method: identity key wrapped with "cosign import-key-pair" plus the identity certificate
+    dirctl sign <cid> --key import-cosign.key --certificate identity-cert.pem
     ```
 
 3. Check verification status using [`dirctl naming verify`](#dirctl-naming-verify-reference).
@@ -1526,8 +1544,20 @@ it is explicitly empty. Use `--password-stdin` to opt in to reading a password f
 standard input. Otherwise, an interactive terminal prompts for the password; a
 non-interactive process does not read standard input implicitly.
 
-Local and inline PEM keys must use the encrypted Cosign/Sigstore format produced by
-`cosign generate-key-pair`.
+Local and inline PEM keys must use the encrypted Cosign/Sigstore format: wrap an existing
+key with `cosign import-key-pair --key <key.pem>` or generate one with
+`cosign generate-key-pair`, and set a non-empty `COSIGN_PASSWORD` for both the cosign
+command and `dirctl sign`.
+
+| Flag | Description |
+|------|-------------|
+| `--key` | Private key reference: KMS URI, file path, HTTP(S) URL, `env://` variable, or inline PEM |
+| `--certificate` | PEM file with the X.509 certificate, or chain, for `--key`; only the certificate matching the key is attached to the signature (requires `--key`). Needed for `ans://` names. |
+| `--password-stdin` | Read the private key password from standard input |
+
+When a certificate is attached, the command prints its `certificate_fingerprint`
+(`SHA256:<hex>`, the same form the ANS transparency log reports) and warns on stderr when
+the certificate is outside its validity period.
 
 The `--key` flag accepts PEM content, a local file, an HTTP(S) URL, an environment
 variable reference, or a KMS URI. The supported KMS URI formats are:
@@ -1558,11 +1588,24 @@ Configure the selected provider's credentials before running `dirctl`.
 
     # Sign with a key managed by Google Cloud KMS
     dirctl sign <cid> --key "gcpkms://projects/PROJECT/locations/LOCATION/keyRings/RING/cryptoKeys/KEY"
+
+    # Sign an ans:// record with the ANS identity key and certificate
+    COSIGN_PASSWORD="$KEY_PASSWORD" dirctl sign <cid> \
+      --key import-cosign.key --certificate identity-cert.pem --output json
+    ```
+
+    Example output with a certificate attached:
+
+    ```json
+    {
+      "signed": true,
+      "certificate_fingerprint": "SHA256:3f1a..."
+    }
     ```
 
 ### `dirctl naming verify <reference>`
 
-Verifies that a record's signing key is authorized by the domain claimed in its name field. Checks if the signing key matches a public key in the domain's JWKS file hosted at `/.well-known/jwks.json`.
+Verifies that a record's signing key is authorized by the domain claimed in its name field. For `https://` and `http://` names it checks whether the signing key matches a public key in the domain's JWKS file hosted at `/.well-known/jwks.json`; for `ans://` names it reports the ANS identity certificate attested by the agent's transparency log.
 
 **Supported Reference Formats:**
 
@@ -1595,6 +1638,27 @@ Verifies that a record's signing key is authorized by the domain claimed in its 
     "method": "jwks",
     "key_id": "key-1",
     "verified_at": "2026-01-21T10:30:00Z"
+    }
+    ```
+
+    Example response for an `ans://` name. `domain` is the agent host without the
+    version label, `key_id` repeats `cert_fingerprint`, and `agent_status` is the
+    status the transparency log reported (`ACTIVE`, `WARNING`, or `DEPRECATED`):
+
+    ```json
+    {
+    "cid": "bafyreib...",
+    "verified": true,
+    "domain": "agent.example.com",
+    "method": "ans",
+    "key_id": "SHA256:3f1a...",
+    "verified_at": "2026-09-11T10:30:00Z",
+    "ans_name": "ans://v1.0.0.agent.example.com/demo",
+    "agent_id": "0f5a2a5e-6d5c-4d3e-9f6a-1b2c3d4e5f60",
+    "log_url": "https://log.ans.example.com",
+    "receipt_uri": "https://log.ans.example.com/v1/agents/0f5a2a5e-6d5c-4d3e-9f6a-1b2c3d4e5f60/receipt",
+    "cert_fingerprint": "SHA256:3f1a...",
+    "agent_status": "ACTIVE"
     }
     ```
 

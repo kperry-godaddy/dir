@@ -194,11 +194,13 @@ dirctl verify "$RECORD_CID"
 ## Name Verification
 
 Name verification proves that the signing key is authorized by the domain claimed in the
-record's name field, enabling human-readable references instead of CIDs. For the concept and
-requirements (protocol prefix, JWKS hosting, matching signing key), see
+record's name field, enabling human-readable references instead of CIDs. The protocol prefix
+of the name selects the method: `https://` and `http://` names are verified through a JWKS
+file hosted by the domain, `ans://` names through the agent's Agent Name Service (ANS)
+identity certificate. For the concept and requirements, see
 [Trust Model — Name verification](dir-component-trust-model.md#name-verification).
 
-### Workflow
+### JWKS Workflow
 
 ```bash
 # 1. Create a record with a verifiable name (already done in Build section)
@@ -240,6 +242,46 @@ When verification succeeds, you'll receive a response like:
   "verified_at": "2026-01-21T10:30:00Z"
 }
 ```
+
+### ANS Workflow
+
+A record named `ans://vX.Y.Z.host[/path]` is verified through the identity certificate that
+the Agent Name Service issued for the agent, so no JWKS file has to be hosted. The reconciler
+must have the method enabled (`name.ans.enabled` with `trusted_log_hosts` and `root_keys`).
+
+```bash
+# 1. Obtain the agent's identity key and certificate from the ANS registration
+#    authority (RA) that registered the agent. Keep the key private; the
+#    certificate is public.
+#    identity-key.pem   PKCS#8 private key
+#    identity-cert.pem  X.509 identity certificate (URI SAN ans://v1.0.0.agent.example.com)
+
+# 2. Wrap the key for Cosign. This writes import-cosign.key and import-cosign.pub;
+#    -y skips the overwrite prompt. The import rejects encrypted PKCS#8 input, so
+#    decrypt such a key first: openssl pkey -in identity-key.pem -out identity-key.pem
+export COSIGN_PASSWORD=your_password_here
+cosign import-key-pair --key identity-key.pem -y
+
+# 3. Push a record whose name is the agent's ANS name
+#    The record.json has: "name": "ans://v1.0.0.agent.example.com/demo"
+RECORD_CID=$(dirctl push record.json --output raw)
+
+# 4. Sign with the identity key and attach the identity certificate.
+#    The output includes the certificate fingerprint the transparency log attests.
+dirctl sign $RECORD_CID --key import-cosign.key --certificate identity-cert.pem --output json
+
+# 5. Verify the name authorization once the reconciler has run
+dirctl naming verify $RECORD_CID --output json
+```
+
+A verified `ans://` record reports `"method": "ans"`, the certificate fingerprint as
+`key_id` and `cert_fingerprint`, and `agent_status` as the transparency log reported it
+(`ACTIVE`, `WARNING`, or `DEPRECATED`). A `DEPRECATED` agent still verifies; check
+`agent_status` before relying on the record. A KMS-held identity key works the same way:
+pass its URI to `--key` instead of the imported file.
+
+After the identity certificate is renewed, re-sign the record with the new certificate;
+otherwise verification fails at the first re-check past the old certificate's `NotAfter`.
 
 ### Using Verified Names
 

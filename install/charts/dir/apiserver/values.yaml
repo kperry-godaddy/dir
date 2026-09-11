@@ -848,6 +848,19 @@ reconciler:
     name:
       enabled: true
       interval: "1h"
+      # Agent Name Service (ANS) verification for records named
+      # ans://vX.Y.Z.host[/path], signed with the agent's ANS identity key and
+      # certificate. root_keys lines come from each log's /root-keys.
+      # ans:
+      #   enabled: false
+      #   trusted_log_hosts:
+      #     - "log.ans.example.com"
+      #   root_keys:
+      #     - "log.ans.example.com+abcd1234+BASE64KEY"
+      #   allow_unpinned_root_keys: false
+      #   timeout: "10s"
+      #   dns_server: ""
+      #   ca_file: ""
 
     # Signature task configuration
     signature:

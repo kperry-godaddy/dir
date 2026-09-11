@@ -83,13 +83,90 @@ Name verification proves that the signing key is authorized by the domain claime
 record's `name` field. This provides cryptographic proof of domain ownership and enables
 human-readable references while maintaining security.
 
-A record qualifies for name verification when:
+The protocol prefix of the record name selects the verification method.
+
+#### JWKS well-known file (`https://`, `http://`)
+
+A record qualifies for JWKS verification when:
 
 - The record name includes a protocol prefix: `https://domain/path` or `http://domain/path`.
 - A [JWKS (JSON Web Key Set)](https://datatracker.ietf.org/doc/html/rfc7517) file is hosted
   at `<scheme>://<domain>/.well-known/jwks.json`.
 - The record is signed with the private key corresponding to a public key present in that
   JWKS file.
+
+#### Agent Name Service (`ans://`)
+
+A record named `ans://vX.Y.Z.host[/path]` names an agent registered with the
+[Agent Name Service (ANS)](https://github.com/agentnameservice/ans): `host` is the agent's
+host name and `vX.Y.Z` the registered version. The record is verified against the agent's
+ANS identity certificate instead of a JWKS file, so no well-known file has to be hosted.
+
+Sign the record with the ANS identity key using key-based signing and attach the identity
+certificate:
+
+- Keep the key in a KMS and pass its URI to `--key`, or wrap the key file for Cosign with
+  `cosign import-key-pair --key identity-key.pem`. The import writes `import-cosign.key`
+  and `import-cosign.pub` (`-y` skips the overwrite prompt) and rejects encrypted PKCS#8
+  input, so decrypt such a key first with `openssl pkey`. Set a non-empty
+  `COSIGN_PASSWORD` for both the import and `dirctl sign`.
+- Pass the identity certificate, or its chain, with `--certificate identity-cert.pem`. Only
+  the certificate matching the signing key is attached to the signature. OIDC signatures
+  cannot verify an `ans://` name.
+
+```bash
+COSIGN_PASSWORD=... dirctl sign <cid> --key import-cosign.key --certificate identity-cert.pem
+```
+
+The reconciler verifies an `ans://` record when all of the following hold:
+
+- A certificate is attached to a signature that verifies over the record with that
+  certificate's key. Public-key referrers on their own are not trusted for `ans://` names.
+- The certificate names the record's agent in its URI SAN and is within its validity period.
+- The agent's `_ans-badge` DNS record points at a transparency log whose host is on the
+  `trusted_log_hosts` allow-list.
+- The log's signing keys are pinned in `root_keys`, or `allow_unpinned_root_keys: true`
+  explicitly accepts fetching them over TLS from the trusted hosts.
+- The log's signed status token names the agent id and the ANS name, reports status
+  `ACTIVE`, `WARNING`, or `DEPRECATED`, and attests the attached certificate's fingerprint.
+- The log's signed receipt covers the agent's registration event for the same agent id and
+  ANS name.
+
+The receipt check has a known limit: the receipt signature covers the event only; tree
+size, leaf index and inclusion path are unsigned header data checked for well-formedness
+and not compared with any published checkpoint, so the receipt proves the log signed this
+event and nothing about its position.
+
+The method is configured on the reconciler under `name.ans.*` (`reconciler.name.ans.*` in
+daemon mode):
+
+| Key | Purpose |
+|-----|---------|
+| `enabled` | Turn the method on. While it is off, `ans://` records are skipped and picked up on the first run after it is enabled. |
+| `trusted_log_hosts` | Transparency-log hosts (`host` or `host:port`) that `_ans-badge` records may point at. Required. |
+| `root_keys` | Pinned log signing keys as root-key lines (`origin+kid+base64`) copied from each log's `/root-keys`. |
+| `allow_unpinned_root_keys` | Run without `root_keys`; trust then rests on TLS to the trusted hosts. |
+| `timeout` | Total time budget for one lookup, DNS included (default `10s`). Must stay below `record_timeout`. |
+| `dns_server` | Resolver (`host:port`) for the `_ans-badge` lookups instead of the system resolver. |
+| `ca_file` | PEM certificates added to the system roots trusted for log connections. |
+
+Operational notes:
+
+- Transient failures (DNS timeouts, an unreachable or failing log, a receipt not yet covered
+  by a checkpoint) are retried with a doubling backoff that starts at the task interval and
+  is capped at 24 hours. Eight consecutive transient failures mark the record failed with a
+  daily retry. A previously verified record stays verified during backoff.
+- Terminal failures (revoked agent, certificate not attested, untrusted log host) mark the
+  record failed until the re-check after `name.ttl`, so a revocation in ANS becomes visible
+  within `name.ttl`.
+- Slow DNS shares the `timeout` budget with the log fetches; raise `timeout` when the
+  resolver is slow.
+- After the identity certificate is renewed, re-sign the record with the new certificate.
+  Otherwise verification fails at the first re-check past the old certificate's `NotAfter`.
+- To roll back after reverting the method, mark its rows failed:
+  `UPDATE name_verifications SET status='failed', error='ans method removed' WHERE method='ans'`.
+- To force re-verification after fixing a bad configuration:
+  `UPDATE name_verifications SET next_attempt_at=CURRENT_TIMESTAMP WHERE method='ans' AND status='failed'`.
 
 Once a name is verified, records can be referenced using Docker-style name references
 (`name`, `name:version`, `name:version@cid`) instead of raw CIDs. See

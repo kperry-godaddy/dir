@@ -1,0 +1,72 @@
+// Copyright AGNTCY Contributors (https://github.com/agntcy)
+// SPDX-License-Identifier: Apache-2.0
+
+package ans
+
+import (
+	"sync"
+	"time"
+)
+
+// breaker is a per-host circuit breaker over connection-level failures. It
+// keeps a black-holed transparency log from spending the caller's whole time
+// budget on every record that points at it.
+type breaker struct {
+	mu        sync.Mutex
+	failures  map[string]int
+	downUntil map[string]time.Time
+}
+
+func newBreaker() *breaker {
+	return &breaker{
+		failures:  make(map[string]int),
+		downUntil: make(map[string]time.Time),
+	}
+}
+
+// openUntil reports whether host's circuit is open at now and, if so, until
+// when.
+func (b *breaker) openUntil(host string, now time.Time) (time.Time, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	until, ok := b.downUntil[host]
+	if !ok {
+		return time.Time{}, false
+	}
+
+	if !now.Before(until) {
+		delete(b.downUntil, host)
+
+		return time.Time{}, false
+	}
+
+	return until, true
+}
+
+// observe records the outcome of one request to host. A connection-level
+// failure counts toward the threshold; anything else, including an HTTP error
+// response, proves the host reachable and resets the count. It reports the
+// cooldown end when this observation opened the circuit.
+func (b *breaker) observe(host string, err error, now time.Time) (time.Time, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if !isConnectionFailure(err) {
+		delete(b.failures, host)
+
+		return time.Time{}, false
+	}
+
+	b.failures[host]++
+	if b.failures[host] < breakerThreshold {
+		return time.Time{}, false
+	}
+
+	delete(b.failures, host)
+
+	until := now.Add(breakerCooldown)
+	b.downUntil[host] = until
+
+	return until, true
+}

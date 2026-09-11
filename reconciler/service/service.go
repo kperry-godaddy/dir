@@ -20,6 +20,7 @@ import (
 	"github.com/agntcy/dir/reconciler/tasks/scan"
 	"github.com/agntcy/dir/reconciler/tasks/signature"
 	namingprovider "github.com/agntcy/dir/server/naming"
+	"github.com/agntcy/dir/server/naming/ans"
 	"github.com/agntcy/dir/server/naming/wellknown"
 	servertypes "github.com/agntcy/dir/server/types"
 	"github.com/agntcy/dir/utils/logging"
@@ -153,6 +154,15 @@ func (s *Service) registerNameTask(cfg name.Config, db servertypes.DatabaseAPI, 
 
 	opts := []namingprovider.ProviderOption{
 		namingprovider.WithWellKnownLookup(wellknown.NewFetcher()),
+	}
+
+	if cfg.ANS.Enabled {
+		verifier, err := ans.NewVerifier(cfg.ANS)
+		if err != nil {
+			return fmt.Errorf("failed to create ans name verifier: %w", err)
+		}
+
+		opts = append(opts, namingprovider.WithLookup(namingprovider.ANSProtocol, verifier))
 	}
 
 	t, err := name.NewTask(cfg, db, signature.NewStoreFetcher(refStore), namingprovider.NewProvider(opts...))

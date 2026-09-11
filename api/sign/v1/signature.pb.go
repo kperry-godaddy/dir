@@ -46,6 +46,11 @@ type Signature struct {
 	// Base64-encoded signature.
 	Signature string `protobuf:"bytes,4,opt,name=signature,proto3" json:"signature,omitempty"`
 	// Base64-encoded signing certificate.
+	// OIDC signing stores the Sigstore-issued certificate here. Key-based
+	// signing may store any X.509 certificate for the signing key (for
+	// example an Agent Name Service identity certificate); signature
+	// verification selects the key path by content_bundle being empty, not
+	// by this field.
 	Certificate string `protobuf:"bytes,5,opt,name=certificate,proto3" json:"certificate,omitempty"`
 	// Type of the signature content bundle.
 	ContentType string `protobuf:"bytes,6,opt,name=content_type,json=contentType,proto3" json:"content_type,omitempty"`

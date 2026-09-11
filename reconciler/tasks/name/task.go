@@ -110,27 +110,26 @@ func (t *Task) verifyNameOwnership(ctx context.Context, cid, recordName string) 
 		return false
 	}
 
-	var lastResult *namingprovider.Result
-
+	signers := make([]namingprovider.Signer, 0, len(publicKeys))
 	for _, publicKey := range publicKeys {
-		result := t.provider.Verify(ctx, recordName, publicKey)
-		lastResult = result
+		signers = append(signers, namingprovider.Signer{Key: publicKey})
+	}
 
-		if result.Verified {
-			t.storeNameVerificationResult(cid, result.Method, result.MatchedKeyID, "")
+	result := t.provider.Verify(ctx, recordName, signers)
+	if result.Verified {
+		t.storeNameVerificationResult(cid, result.Method, result.MatchedKeyID, "")
 
-			logger.Info("Name verification successful", "cid", cid, "domain", result.Domain, "method", result.Method)
+		logger.Info("Name verification successful", "cid", cid, "domain", result.Domain, "method", result.Method)
 
-			return true
-		}
+		return true
 	}
 
 	errMsg := "verification failed"
-	if lastResult != nil && lastResult.Error != "" {
-		errMsg = lastResult.Error
+	if result.Error != "" {
+		errMsg = result.Error
 	}
 
-	t.storeNameVerificationResult(cid, lastResult.Method, "", errMsg)
+	t.storeNameVerificationResult(cid, result.Method, "", errMsg)
 
 	return false
 }

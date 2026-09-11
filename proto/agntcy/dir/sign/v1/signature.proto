@@ -29,6 +29,11 @@ message Signature {
   string signature = 4;
 
   // Base64-encoded signing certificate.
+  // OIDC signing stores the Sigstore-issued certificate here. Key-based
+  // signing may store any X.509 certificate for the signing key (for
+  // example an Agent Name Service identity certificate); signature
+  // verification selects the key path by content_bundle being empty, not
+  // by this field.
   string certificate = 5;
 
   // Type of the signature content bundle.

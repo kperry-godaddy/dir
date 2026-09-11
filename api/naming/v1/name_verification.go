@@ -11,3 +11,12 @@ func NewDomainVerification(dv *DomainVerification) *Verification {
 		},
 	}
 }
+
+// NewAnsVerification creates a new Verification with AnsVerification info.
+func NewAnsVerification(av *AnsVerification) *Verification {
+	return &Verification{
+		Info: &Verification_Ans{
+			Ans: av,
+		},
+	}
+}

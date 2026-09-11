@@ -13,8 +13,39 @@ message Verification {
   oneof info {
     // Domain verification details.
     DomainVerification domain = 1;
+    // Agent Name Service verification details.
+    AnsVerification ans = 2;
     // Future verification types can be added here.
   }
+}
+
+// AnsVerification represents the result of verifying that a record's
+// signing key belongs to the Agent Name Service (ANS) agent named by the
+// record's ans:// name. The key is proven through the agent's identity
+// certificate, attested by the agent's transparency log.
+message AnsVerification {
+  // The ANS name that was verified (e.g., "ans://v1.0.0.agent.example.com").
+  string ans_name = 1;
+
+  // The agent identifier in the transparency log.
+  string agent_id = 2;
+
+  // Base URL of the transparency log that attested the certificate.
+  string log_url = 3;
+
+  // URL of the agent's SCITT receipt on the transparency log.
+  string receipt_uri = 4;
+
+  // SHA-256 fingerprint ("SHA256:<hex>") of the identity certificate whose
+  // key signed the record. Matches the transparency log's attestation.
+  string cert_fingerprint = 5;
+
+  // Agent status reported by the transparency log at verification time
+  // (ACTIVE, WARNING, or DEPRECATED).
+  string agent_status = 6;
+
+  // When the verification was performed.
+  google.protobuf.Timestamp verified_at = 7;
 }
 
 // DomainVerification represents the result of verifying that a record's

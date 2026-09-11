@@ -123,6 +123,14 @@ message SignWithKey {
 
   // Password to unlock the private key (if encrypted).
   optional bytes password = 2;
+
+  // X.509 certificate(s) for the signing key, PEM-encoded inline.
+  // Unlike private_key, this field accepts no file, URL, or KMS references.
+  // A single certificate or a chain may be given; the certificate whose
+  // public key matches private_key is attached to Signature.certificate as
+  // base64-encoded DER and the others are ignored. Signing fails when no
+  // certificate matches. Not used with OIDC signing.
+  optional string certificate = 3;
 }
 
 message SignWithOIDC {

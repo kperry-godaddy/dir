@@ -17,6 +17,7 @@ import (
 	"github.com/agntcy/dir/reconciler/tasks/signature"
 	authnconfig "github.com/agntcy/dir/server/authn/config"
 	dbconfig "github.com/agntcy/dir/server/database/config"
+	ansconfig "github.com/agntcy/dir/server/naming/ans/config"
 	namingconfig "github.com/agntcy/dir/server/naming/config"
 	ociconfig "github.com/agntcy/dir/server/store/oci/config"
 	"github.com/agntcy/dir/utils/logging"
@@ -188,6 +189,24 @@ func LoadConfig() (*Config, error) {
 
 	_ = v.BindEnv("name.record_timeout")
 	v.SetDefault("name.record_timeout", name.DefaultRecordTimeout)
+
+	//
+	// ANS verification method for ans:// names (name task)
+	//
+	_ = v.BindEnv("name.ans.enabled")
+	v.SetDefault("name.ans.enabled", false)
+
+	_ = v.BindEnv("name.ans.trusted_log_hosts")
+	_ = v.BindEnv("name.ans.root_keys")
+
+	_ = v.BindEnv("name.ans.allow_unpinned_root_keys")
+	v.SetDefault("name.ans.allow_unpinned_root_keys", false)
+
+	_ = v.BindEnv("name.ans.timeout")
+	v.SetDefault("name.ans.timeout", ansconfig.DefaultTimeout)
+
+	_ = v.BindEnv("name.ans.dns_server")
+	_ = v.BindEnv("name.ans.ca_file")
 
 	//
 	// Signature task configuration (signature verification cache)

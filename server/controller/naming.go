@@ -14,6 +14,7 @@ import (
 	namingv1 "github.com/agntcy/dir/api/naming/v1"
 	gormdb "github.com/agntcy/dir/server/database/gorm"
 	"github.com/agntcy/dir/server/naming"
+	"github.com/agntcy/dir/server/naming/ans"
 	namingconfig "github.com/agntcy/dir/server/naming/config"
 	"github.com/agntcy/dir/server/types"
 	"github.com/agntcy/dir/utils/logging"
@@ -121,14 +122,62 @@ func (n *namingCtrl) GetVerificationInfo(ctx context.Context, req *namingv1.GetV
 	namingLogger.Debug("Returning verification from database", "cid", cid)
 
 	return &namingv1.GetVerificationInfoResponse{
-		Verified: true,
-		Verification: namingv1.NewDomainVerification(&namingv1.DomainVerification{
-			Domain:     n.getDomainFromRecord(ctx, cid),
-			Method:     latest.GetMethod(),
-			KeyId:      latest.GetKeyID(),
-			VerifiedAt: timestamppb.New(latest.GetUpdatedAt()),
-		}),
+		Verified:     true,
+		Verification: n.buildVerification(ctx, cid, latest),
 	}, nil
+}
+
+// buildVerification maps a verified row to the wire shape of its method: an
+// AnsVerification for the ans method, a DomainVerification otherwise.
+func (n *namingCtrl) buildVerification(ctx context.Context, cid string, latest types.NameVerificationObject) *namingv1.Verification {
+	verifiedAt := timestamppb.New(verifiedAtOf(latest))
+
+	if latest.GetMethod() == string(naming.MethodANS) {
+		return buildAnsVerification(cid, latest, verifiedAt)
+	}
+
+	return namingv1.NewDomainVerification(&namingv1.DomainVerification{
+		Domain:     n.getDomainFromRecord(ctx, cid),
+		Method:     latest.GetMethod(),
+		KeyId:      latest.GetKeyID(),
+		VerifiedAt: verifiedAt,
+	})
+}
+
+// buildAnsVerification decodes the stored ans details. A row whose details
+// are missing or unreadable still reports the certificate fingerprint and the
+// verification time, so a verified record is never shown as unverified.
+func buildAnsVerification(cid string, latest types.NameVerificationObject, verifiedAt *timestamppb.Timestamp) *namingv1.Verification {
+	verification := &namingv1.AnsVerification{
+		CertFingerprint: latest.GetKeyID(),
+		VerifiedAt:      verifiedAt,
+	}
+
+	details, err := ans.DecodeDetails([]byte(latest.GetDetails()))
+	if err != nil {
+		namingLogger.Error("Stored ans verification details are unreadable", "cid", cid, "error", err)
+
+		return namingv1.NewAnsVerification(verification)
+	}
+
+	verification.AnsName = details.AnsName
+	verification.AgentId = details.AgentID
+	verification.LogUrl = details.LogURL
+	verification.ReceiptUri = details.ReceiptURI
+	verification.AgentStatus = details.AgentStatus
+
+	return namingv1.NewAnsVerification(verification)
+}
+
+// verifiedAtOf is the last successful verification. Rows written before the
+// verified_at column existed fall back to updated_at, which for a verified row
+// is the time of that verdict.
+func verifiedAtOf(v types.NameVerificationObject) time.Time {
+	if at := v.GetVerifiedAt(); at != nil {
+		return *at
+	}
+
+	return v.GetUpdatedAt()
 }
 
 // isVerificationValid checks if a verification is valid (verified status and not expired).
@@ -213,19 +262,24 @@ func (n *namingCtrl) Resolve(ctx context.Context, req *namingv1.ResolveRequest) 
 }
 
 // expandNameWithProtocols returns name variations to search for.
-// If the name already has a protocol prefix, returns it as-is.
-// Otherwise, returns exact match plus http:// and https:// variations.
-// This allows finding both:
+// If the name already has a verification protocol prefix (https://, http://,
+// ans://), returns it as-is. Otherwise, returns exact match plus http:// and
+// https:// variations. This allows finding both:
 // - Records with protocol prefixes (verifiable names like "https://cisco.com/agent")
 // - Records without protocol prefixes (non-verifiable names like "my-org/agent").
+//
+// An ans:// name carries a version label in its host, so a bare name is never
+// expanded with that prefix.
 func expandNameWithProtocols(name string) []string {
-	if strings.HasPrefix(name, "http://") || strings.HasPrefix(name, "https://") {
-		return []string{name}
+	for _, prefix := range naming.VerifiablePrefixes() {
+		if strings.HasPrefix(name, prefix) {
+			return []string{name}
+		}
 	}
 
 	return []string{
 		name, // exact match for non-verifiable names
-		"http://" + name,
-		"https://" + name,
+		naming.HTTPProtocol + name,
+		naming.HTTPSProtocol + name,
 	}
 }

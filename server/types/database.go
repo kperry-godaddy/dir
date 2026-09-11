@@ -118,11 +118,18 @@ type NameVerificationDatabaseAPI interface {
 	// UpdateNameVerification updates an existing name verification for a record.
 	UpdateNameVerification(verification NameVerificationObject) error
 
+	// UpdateNameVerificationSchedule records the retry state after a transient
+	// failure: status, consecutive_failures, next_attempt_at and error. It
+	// leaves updated_at, key_id, details and verified_at untouched, so
+	// updated_at keeps meaning "last verdict".
+	UpdateNameVerificationSchedule(cid string, status string, consecutiveFailures int, nextAttemptAt *time.Time, errMsg string) error
+
 	// GetVerificationByCID retrieves the verification for a record.
 	GetVerificationByCID(cid string) (NameVerificationObject, error)
 
 	// GetRecordsNeedingVerification retrieves signed records with verifiable names
-	// that either don't have a verification or have an expired verification.
+	// that have no verification, an expired verification, or a scheduled retry
+	// that is due.
 	GetRecordsNeedingVerification(ttl time.Duration) ([]coretypes.Record, error)
 }
 

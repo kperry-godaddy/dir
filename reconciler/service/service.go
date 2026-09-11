@@ -76,16 +76,9 @@ func (s *Service) registerTasks(cfg *config.Config, db servertypes.DatabaseAPI, 
 	}
 
 	if cfg.Name.Enabled {
-		np := namingprovider.NewProvider(
-			namingprovider.WithWellKnownLookup(wellknown.NewFetcher()),
-		)
-
-		t, err := name.NewTask(cfg.Name, db, store, np)
-		if err != nil {
-			return fmt.Errorf("failed to create name task: %w", err)
+		if err := s.registerNameTask(cfg.Name, db, store); err != nil {
+			return err
 		}
-
-		s.addTask(t)
 	}
 
 	if cfg.Signature.Enabled {
@@ -128,6 +121,46 @@ func (s *Service) registerTasks(cfg *config.Config, db servertypes.DatabaseAPI, 
 			s.addTask(t)
 		}
 	}
+
+	return nil
+}
+
+// registerNameTask validates the name task configuration, logs the effective
+// settings and registers the task with one verification method per protocol.
+func (s *Service) registerNameTask(cfg name.Config, db servertypes.DatabaseAPI, store servertypes.StoreAPI) error {
+	if err := cfg.Validate(); err != nil {
+		return fmt.Errorf("invalid name task configuration: %w", err)
+	}
+
+	refStore, ok := store.(servertypes.ReferrerStoreAPI)
+	if !ok {
+		logger.Warn("Store does not support referrers, skipping name task")
+
+		return nil
+	}
+
+	logger.Info("Name task configuration",
+		"interval", cfg.GetInterval(),
+		"ttl", cfg.GetTTL(),
+		"recordTimeout", cfg.GetRecordTimeout(),
+		"ansEnabled", cfg.ANS.Enabled,
+		"ansTrustedLogHosts", cfg.ANS.TrustedLogHosts,
+		"ansRootKeys", cfg.ANS.RootKeys,
+		"ansAllowUnpinnedRootKeys", cfg.ANS.AllowUnpinnedRootKeys,
+		"ansTimeout", cfg.ANS.GetTimeout(),
+		"ansDNSServer", cfg.ANS.DNSServer,
+		"ansCAFile", cfg.ANS.CAFile)
+
+	opts := []namingprovider.ProviderOption{
+		namingprovider.WithWellKnownLookup(wellknown.NewFetcher()),
+	}
+
+	t, err := name.NewTask(cfg, db, signature.NewStoreFetcher(refStore), namingprovider.NewProvider(opts...))
+	if err != nil {
+		return fmt.Errorf("failed to create name task: %w", err)
+	}
+
+	s.addTask(t)
 
 	return nil
 }

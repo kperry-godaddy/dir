@@ -34,12 +34,56 @@ The indexer task monitors the local OCI registry and indexes records into the se
 
 ### Name Task
 
-The name task re-verifies DNS/name ownership of named records and caches results. It:
+The name task verifies ownership of named records and caches results. The protocol prefix of the record name selects the method:
 
-1. Queries the database for signed records with verifiable names that need verification (missing or expired)
-2. For each record, retrieves the record name and public keys attached to the record
-3. Verifies name ownership (e.g. via well-known JWKS at the record’s domain)
-4. Stores the verification result (verified or failed) in the database for efficient API filtering
+- `https://` and `http://` names: one of the record's public keys must appear in the domain's `/.well-known/jwks.json` (RFC 7517).
+- `ans://v{MAJOR}.{MINOR}.{PATCH}.{agentHost}[/path]` names: the record must carry a signature made with the agent's Agent Name Service (ANS) identity key, with the identity certificate attached (`dirctl sign --key <key> --certificate <identity-cert.pem>`). The task keeps only certificates whose key verifiably produced a signature over the record CID, so a copied certificate proves nothing. The verifier then proves the certificate through the agent's `_ans-badge` DNS record and the transparency log's status token and receipt.
+
+It:
+
+1. Queries the database for signed records with verifiable names that have no verification, an expired one (per `name.ttl`), or a scheduled retry that is due
+2. For each record, collects the signers: verified certificate signatures for `ans://` names, the attached public keys for the others
+3. Runs the verification method selected by the name's protocol once per record
+4. Stores the result (`verified`, `failed`, or `pending`) in the database for efficient API filtering
+
+Records whose protocol has no method configured (for example `ans://` names while `name.ans.enabled` is false) are skipped without writing a row and counted in one warning per run, so enabling the method takes effect on the next run rather than after the TTL.
+
+#### ANS configuration
+
+| Key | Environment variable | Default | Description |
+|-----|----------------------|---------|-------------|
+| `name.ans.enabled` | `RECONCILER_NAME_ANS_ENABLED` | `false` | Verify `ans://` names |
+| `name.ans.trusted_log_hosts` | `RECONCILER_NAME_ANS_TRUSTED_LOG_HOSTS` | | Transparency-log hosts (`host` or `host:port`, comma-separated in the environment) that badge records may point at; required when enabled |
+| `name.ans.root_keys` | `RECONCILER_NAME_ANS_ROOT_KEYS` | | Pinned root-key lines (`origin+kid+base64`) of the trusted logs, comma-separated in the environment |
+| `name.ans.allow_unpinned_root_keys` | `RECONCILER_NAME_ANS_ALLOW_UNPINNED_ROOT_KEYS` | `false` | Run without pinned keys and fetch them from each log; trust then rests on TLS to the trusted hosts |
+| `name.ans.timeout` | `RECONCILER_NAME_ANS_TIMEOUT` | `10s` | Total budget for one lookup (DNS, then the log fetches); must be shorter than `name.record_timeout` |
+| `name.ans.dns_server` | `RECONCILER_NAME_ANS_DNS_SERVER` | | Resolver (`host:port`) for the `_ans-badge` lookups instead of the system resolver |
+| `name.ans.ca_file` | `RECONCILER_NAME_ANS_CA_FILE` | | PEM certificates added to the system roots for transparency-log connections |
+
+Slow DNS eats into the same `name.ans.timeout` budget as the log fetches; raise it if lookups time out on a healthy log.
+
+#### Result states and retries
+
+- `verified` and `failed` are verdicts. They are re-checked after `name.ttl`. A revoked agent, a name that does not match the attested one, a missing or unattested certificate and an expired certificate are all `failed`.
+- `pending` means no verdict yet because every attempt failed transiently (DNS or the transparency log unreachable). Retries follow the schedule the scan task uses: the first retry after `name.interval`, doubling on each further strike, capped at 24 hours. A method that reports its dependency as down sets the retry time directly without counting a strike.
+- A previously verified record keeps `verified`, its certificate fingerprint and its details through transient failures until the TTL expires; only the retry state and the error change.
+- After 8 consecutive transient failures the row becomes `failed` with `verification unavailable after 8 consecutive transient failures; last: …` and is retried once a day.
+
+`dirctl naming verify` reports the stored error for `pending` and `failed` rows.
+
+#### Operator steps
+
+Rollback after removing the ANS method, so rows it verified do not stay verified until the TTL:
+
+```sql
+UPDATE name_verifications SET status='failed', error='ans method removed' WHERE method='ans';
+```
+
+Force re-verification of failed rows after fixing a bad configuration:
+
+```sql
+UPDATE name_verifications SET next_attempt_at=CURRENT_TIMESTAMP WHERE method='ans' AND status='failed';
+```
 
 ### Signature Task
 

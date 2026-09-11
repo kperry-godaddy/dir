@@ -4,9 +4,11 @@
 package name
 
 import (
+	"fmt"
 	"time"
 
-	naming "github.com/agntcy/dir/server/naming/config"
+	ansconfig "github.com/agntcy/dir/server/naming/ans/config"
+	namingconfig "github.com/agntcy/dir/server/naming/config"
 )
 
 const (
@@ -31,6 +33,9 @@ type Config struct {
 
 	// RecordTimeout is the timeout for each individual name verification operation.
 	RecordTimeout time.Duration `json:"record_timeout,omitempty" mapstructure:"record_timeout"`
+
+	// ANS configures Agent Name Service verification for ans:// names.
+	ANS ansconfig.Config `json:"ans" mapstructure:"ans"`
 }
 
 // GetInterval returns the interval with default fallback.
@@ -46,7 +51,7 @@ func (c *Config) GetInterval() time.Duration {
 // The default is shared with the API server (server/naming.DefaultTTL) so both services use the same expiry.
 func (c *Config) GetTTL() time.Duration {
 	if c.TTL == 0 {
-		return naming.DefaultTTL
+		return namingconfig.DefaultTTL
 	}
 
 	return c.TTL
@@ -59,4 +64,20 @@ func (c *Config) GetRecordTimeout() time.Duration {
 	}
 
 	return c.RecordTimeout
+}
+
+// Validate checks the task configuration, including the ANS method's, and
+// normalizes the ANS settings in place. One ANS lookup must fit inside the
+// per-record budget, otherwise the record deadline would cut every lookup
+// short and report it as a transient failure.
+func (c *Config) Validate() error {
+	if err := c.ANS.Validate(); err != nil {
+		return fmt.Errorf("name task: %w", err)
+	}
+
+	if c.ANS.Enabled && c.ANS.GetTimeout() >= c.GetRecordTimeout() {
+		return fmt.Errorf("name task: ans.timeout (%s) must be shorter than record_timeout (%s)", c.ANS.GetTimeout(), c.GetRecordTimeout())
+	}
+
+	return nil
 }

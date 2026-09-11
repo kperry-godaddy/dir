@@ -1546,18 +1546,14 @@ non-interactive process does not read standard input implicitly.
 
 Local and inline PEM keys must use the encrypted Cosign/Sigstore format: wrap an existing
 key with `cosign import-key-pair --key <key.pem>` or generate one with
-`cosign generate-key-pair`, and set a non-empty `COSIGN_PASSWORD` for both the cosign
-command and `dirctl sign`.
+`cosign generate-key-pair`. Set `COSIGN_PASSWORD` to skip the password prompt of both the
+cosign command and `dirctl sign`.
 
-| Flag | Description |
-|------|-------------|
-| `--key` | Private key reference: KMS URI, file path, HTTP(S) URL, `env://` variable, or inline PEM |
-| `--certificate` | PEM file with the X.509 certificate, or chain, for `--key`; only the certificate matching the key is attached to the signature (requires `--key`). Needed for `ans://` names. |
-| `--password-stdin` | Read the private key password from standard input |
-
-When a certificate is attached, the command prints its `certificate_fingerprint`
-(`SHA256:<hex>`, the same form the ANS transparency log reports) and warns on stderr when
-the certificate is outside its validity period.
+`--certificate <file>` attaches the X.509 certificate, or chain, that belongs to `--key`;
+only the certificate matching the key is attached to the signature. `ans://` names need it.
+Certificates outside their validity period are warned about on stderr before signing, and
+the command prints the attached certificate's `certificate_fingerprint` (`SHA256:<hex>`,
+the same form the ANS transparency log reports).
 
 The `--key` flag accepts PEM content, a local file, an HTTP(S) URL, an environment
 variable reference, or a KMS URI. The supported KMS URI formats are:
@@ -1642,8 +1638,9 @@ Verifies that a record's signing key is authorized by the domain claimed in its 
     ```
 
     Example response for an `ans://` name. `domain` is the agent host without the
-    version label, `key_id` repeats `cert_fingerprint`, and `agent_status` is the
-    status the transparency log reported (`ACTIVE`, `WARNING`, or `DEPRECATED`):
+    version label, `ans_name` is the name the transparency log attests (the record
+    name without its path), `key_id` repeats `cert_fingerprint`, and `agent_status`
+    is the status the log reported (`ACTIVE`, `WARNING`, or `DEPRECATED`):
 
     ```json
     {
@@ -1653,7 +1650,7 @@ Verifies that a record's signing key is authorized by the domain claimed in its 
     "method": "ans",
     "key_id": "SHA256:3f1a...",
     "verified_at": "2026-09-11T10:30:00Z",
-    "ans_name": "ans://v1.0.0.agent.example.com/demo",
+    "ans_name": "ans://v1.0.0.agent.example.com",
     "agent_id": "0f5a2a5e-6d5c-4d3e-9f6a-1b2c3d4e5f60",
     "agent_host": "agent.example.com",
     "log_url": "https://log.ans.example.com",

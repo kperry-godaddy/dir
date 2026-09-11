@@ -250,17 +250,21 @@ the Agent Name Service issued for the agent, so no JWKS file has to be hosted. T
 must have the method enabled (`name.ans.enabled` with `trusted_log_hosts` and `root_keys`).
 
 ```bash
-# 1. Obtain the agent's identity key and certificate from the ANS registration
-#    authority (RA) that registered the agent. Keep the key private; the
-#    certificate is public.
+# 1. Use the identity key you generated for the agent's registration CSR and the
+#    certificate the ANS registration authority (RA) issued for it. The RA never
+#    sees the private key; keep it private, the certificate is public.
 #    identity-key.pem   PKCS#8 private key
 #    identity-cert.pem  X.509 identity certificate (URI SAN ans://v1.0.0.agent.example.com)
 
 # 2. Wrap the key for Cosign. This writes import-cosign.key and import-cosign.pub;
 #    -y skips the overwrite prompt. The import rejects encrypted PKCS#8 input, so
-#    decrypt such a key first: openssl pkey -in identity-key.pem -out identity-key.pem
+#    decrypt the key into a temporary file only you can read, import that, and
+#    delete it. import-cosign.key is the only key file needed afterwards.
 export COSIGN_PASSWORD=your_password_here
-cosign import-key-pair --key identity-key.pem -y
+PLAIN_KEY=$(umask 077 && mktemp)
+openssl pkey -in identity-key.pem -out "$PLAIN_KEY"
+cosign import-key-pair --key "$PLAIN_KEY" -y
+rm -f "$PLAIN_KEY"
 
 # 3. Push a record whose name is the agent's ANS name
 #    The record.json has: "name": "ans://v1.0.0.agent.example.com/demo"

@@ -850,7 +850,8 @@ reconciler:
       interval: "1h"
       # Agent Name Service (ANS) verification for records named
       # ans://vX.Y.Z.host[/path], signed with the agent's ANS identity key and
-      # certificate. root_keys lines come from each log's /root-keys.
+      # certificate. root_keys lines come from each log's /root-keys. Every key
+      # below is set as reconciler.config.name.ans.<key>.
       # ans:
       #   enabled: false
       #   trusted_log_hosts:
@@ -860,7 +861,19 @@ reconciler:
       #   allow_unpinned_root_keys: false
       #   timeout: "10s"
       #   dns_server: ""
-      #   ca_file: ""
+      #   # PEM file added to the system roots for transparency-log connections.
+      #   # Mount it from a Secret with the chart-level extraVolumes and
+      #   # extraVolumeMounts, which both the apiserver and the reconciler
+      #   # pods render:
+      #   #   extraVolumes:
+      #   #     - name: ans-log-ca
+      #   #       secret:
+      #   #         secretName: ans-log-ca
+      #   #   extraVolumeMounts:
+      #   #     - name: ans-log-ca
+      #   #       mountPath: /etc/agntcy/ans
+      #   #       readOnly: true
+      #   ca_file: "/etc/agntcy/ans/ca.pem"
 
     # Signature task configuration
     signature:

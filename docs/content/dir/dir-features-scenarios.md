@@ -260,9 +260,11 @@ must have the method enabled (`name.ans.enabled` with `trusted_log_hosts` and `r
 #    -y skips the overwrite prompt. The import rejects encrypted PKCS#8 input, so
 #    decrypt the key into a temporary file only you can read, import that, and
 #    delete it. import-cosign.key is the only key file needed afterwards.
-export COSIGN_PASSWORD=your_password_here
+#    openssl asks for the identity key's own passphrase; COSIGN_PASSWORD is the
+#    new password Cosign puts on import-cosign.key.
 PLAIN_KEY=$(umask 077 && mktemp)
 openssl pkey -in identity-key.pem -out "$PLAIN_KEY"
+export COSIGN_PASSWORD=your_password_here
 cosign import-key-pair --key "$PLAIN_KEY" -y
 rm -f "$PLAIN_KEY"
 

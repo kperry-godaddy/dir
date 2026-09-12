@@ -153,8 +153,8 @@ certificate's `NotAfter`.
 The method is configured on the reconciler under `name.ans.*` (`reconciler.name.ans.*` in
 daemon mode, `reconciler.config.name.ans.*` in the Helm chart). Raising `timeout` also
 requires `record_timeout` to stay larger. In Kubernetes the `_ans-badge` lookup pays the
-`ndots` search-domain walk of the pod resolver; `ndots: 2` in the pod `dnsConfig` avoids
-most of the extra queries. The configuration keys, the retry schedule and the operator
+`ndots` search-domain walk of the pod resolver; `ndots: 2` in the pod `dnsConfig`
+(`reconciler.dnsConfig` in the Helm chart) avoids most of the extra queries. The configuration keys, the retry schedule and the operator
 steps are in the
 [reconciler README](https://github.com/agntcy/dir/blob/main/reconciler/README.md#name-task).
 

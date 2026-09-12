@@ -753,6 +753,15 @@ reconciler:
   extraVolumes: []
   extraVolumeMounts: []
 
+  # Pod DNS configuration for the reconciler, for example
+  #   dnsConfig:
+  #     options:
+  #       - name: ndots
+  #         value: "2"
+  # so the _ans-badge lookups of the ANS name method skip most of the
+  # search-domain walk.
+  dnsConfig: {}
+
   # Azure OpenAI credentials for the scan task's LLM-backed scanners.
   # These are injected as plain process environment variables into the
   # reconciler container; the scanner subprocesses (mcp-scanner / skill-scanner)

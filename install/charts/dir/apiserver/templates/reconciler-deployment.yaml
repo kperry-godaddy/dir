@@ -29,6 +29,10 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "chart.serviceAccountName" . }}
+      {{- with .Values.reconciler.dnsConfig }}
+      dnsConfig:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: reconciler
           image: "{{ .Values.reconciler.image.repository }}:{{ .Values.reconciler.image.tag }}"

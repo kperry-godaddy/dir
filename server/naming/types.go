@@ -106,6 +106,30 @@ const (
 // the errors they return; Verify turns it into Result.Transient.
 var ErrTransient = errors.New("transient verification failure")
 
+// Transient marks err as caused by an unavailable dependency rather than by the
+// record: errors.Is(err, ErrTransient) reports it and the text is unchanged.
+func Transient(err error) *TransientError {
+	return &TransientError{err: err}
+}
+
+// TransientError is the marker Transient wraps an error in.
+type TransientError struct {
+	err error
+}
+
+func (e *TransientError) Error() string {
+	return e.err.Error()
+}
+
+func (e *TransientError) Unwrap() error {
+	return e.err
+}
+
+// Is reports the error as transient.
+func (e *TransientError) Is(target error) bool {
+	return target == ErrTransient //nolint:errorlint // sentinel identity is the contract of an Is method
+}
+
 // RetryAfterError is a transient failure that also names the earliest time a
 // retry makes sense, for example while a method's circuit breaker for a
 // dependency is open. It matches ErrTransient in errors.Is.

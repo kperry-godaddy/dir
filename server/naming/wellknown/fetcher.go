@@ -8,6 +8,7 @@ package wellknown
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -19,6 +20,9 @@ import (
 
 // WellKnownPath is the path for the JWKS well-known file (RFC 7517).
 const WellKnownPath = "/.well-known/jwks.json"
+
+// maxJWKSBytes bounds the well-known file; a key set is a few kilobytes.
+const maxJWKSBytes = 1 << 20
 
 var logger = logging.Logger("naming/wellknown")
 
@@ -92,12 +96,18 @@ func (f *Fetcher) LookupKeysWithScheme(ctx context.Context, domain, scheme strin
 
 	logger.Debug("Fetching JWKS well-known file", "domain", domain, "url", url)
 
-	// Fetch and parse JWKS using the jwx library
-	keySet, err := jwk.Fetch(fetchCtx, url, jwk.WithHTTPClient(f.client))
+	body, err := f.fetch(fetchCtx, url)
 	if err != nil {
 		logger.Debug("Failed to fetch JWKS", "domain", domain, "error", err)
 
-		return nil, fmt.Errorf("failed to fetch JWKS from %s: %w", url, err)
+		return nil, err
+	}
+
+	keySet, err := jwk.Parse(body)
+	if err != nil {
+		logger.Debug("Failed to parse JWKS", "domain", domain, "error", err)
+
+		return nil, fmt.Errorf("failed to parse JWKS from %s: %w", url, err)
 	}
 
 	logger.Debug("Received JWKS file", "domain", domain, "keyCount", keySet.Len())
@@ -127,4 +137,42 @@ func (f *Fetcher) LookupKeysWithScheme(ctx context.Context, domain, scheme strin
 	}
 
 	return keys, nil
+}
+
+// fetch downloads the well-known file. Failures before the server answered,
+// a 5xx and a 429 are transient; any other status and an oversized body are
+// facts about the domain and terminal.
+func (f *Fetcher) fetch(ctx context.Context, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build the JWKS request for %s: %w", url, err)
+	}
+
+	resp, err := f.client.Do(req)
+	if err != nil {
+		return nil, naming.Transient(fmt.Errorf("failed to fetch JWKS from %s: %w", url, err))
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		statusErr := fmt.Errorf("JWKS at %s returned HTTP %d", url, resp.StatusCode)
+
+		if resp.StatusCode >= http.StatusInternalServerError || resp.StatusCode == http.StatusTooManyRequests {
+			return nil, naming.Transient(statusErr)
+		}
+
+		return nil, statusErr
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxJWKSBytes+1))
+	if err != nil {
+		return nil, naming.Transient(fmt.Errorf("failed to read JWKS from %s: %w", url, err))
+	}
+
+	if len(body) > maxJWKSBytes {
+		return nil, fmt.Errorf("JWKS at %s exceeds %d bytes", url, maxJWKSBytes)
+	}
+
+	return body, nil
 }

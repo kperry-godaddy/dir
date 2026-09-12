@@ -76,9 +76,16 @@ func TestClassifyPredicates(t *testing.T) {
 			wantDescribe:  "transparency log returned HTTP 429",
 		},
 		{
-			name:         "http 302",
-			err:          &scitt.TransportError{Type: scitt.TransportErrHTTPError, StatusCode: http.StatusFound},
-			wantDescribe: "transparency log returned HTTP 302",
+			name:          "http 302",
+			err:           &scitt.TransportError{Type: scitt.TransportErrHTTPError, StatusCode: http.StatusFound},
+			wantTransient: true,
+			wantDescribe:  "transparency log returned HTTP 302",
+		},
+		{
+			name:          "http 403 from a proxy",
+			err:           &scitt.TransportError{Type: scitt.TransportErrHTTPError, StatusCode: http.StatusForbidden},
+			wantTransient: true,
+			wantDescribe:  "transparency log returned HTTP 403",
 		},
 		{
 			name:          "http 404 is transient",
@@ -258,8 +265,8 @@ func TestClassify(t *testing.T) {
 	}{
 		{name: "nil", err: nil},
 		{name: "terminal passes through", err: terminal, wantErr: "ans certificate: no attached certificate names this agent"},
-		{name: "transient is marked", err: transient, wantErr: "transient verification failure: ans dns: DNS lookup timed out", wantTransient: true},
-		{name: "pending agent is marked", err: pending, wantErr: "transient verification failure: ans status-token: agent status PENDING_DNS does not allow connections", wantTransient: true},
+		{name: "transient is marked", err: transient, wantErr: "ans dns: DNS lookup timed out", wantTransient: true},
+		{name: "pending agent is marked", err: pending, wantErr: "ans status-token: agent status PENDING_DNS does not allow connections", wantTransient: true},
 		{name: "retry after is kept", err: retry, wantErr: "ans log: circuit open (retry after 2023-11-14T22:13:20Z)", wantTransient: true, wantRetry: true},
 	}
 

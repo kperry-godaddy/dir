@@ -84,7 +84,7 @@ func classify(err error) error {
 	}
 
 	if isTransient(err) {
-		return fmt.Errorf("%w: %w", naming.ErrTransient, err)
+		return naming.Transient(err)
 	}
 
 	return err
@@ -126,16 +126,21 @@ func isTransient(err error) bool {
 	return false
 }
 
-// isTransientTransport reports whether an HTTP outcome may change on retry:
-// the log is overloaded or throttling, or it does not know the agent yet.
-// The reference log answers 404 until the agent's first event is sealed.
+// isTransientTransport reports whether an HTTP outcome may change on retry.
+// Only 410 (the agent is terminal) and 501 (the log does not serve the
+// route) state a fact about the agent or the log; every other status, from a
+// 404 before the agent's first event is sealed to a proxy's 403 or 502, is a
+// condition of the moment.
 func isTransientTransport(err *scitt.TransportError) bool {
 	if err.Type == scitt.TransportErrNotFound || err.StatusCode == http.StatusNotFound {
 		return true
 	}
 
-	return err.Type == scitt.TransportErrHTTPError &&
-		(err.StatusCode >= http.StatusInternalServerError || err.StatusCode == http.StatusTooManyRequests)
+	if err.Type != scitt.TransportErrHTTPError || err.StatusCode == 0 {
+		return false
+	}
+
+	return err.StatusCode != http.StatusGone && err.StatusCode != http.StatusNotImplemented
 }
 
 // isConnectionFailure reports whether err says the log produced no HTTP

@@ -8,8 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"net/url"
 	"testing"
 	"time"
 )
@@ -252,10 +250,10 @@ func TestProviderVerifyRegisteredMethod(t *testing.T) {
 			name: "transient failure",
 			lookup: &fakeMethodLookup{
 				method: MethodANS,
-				err:    fmt.Errorf("%w: ans dns: timeout", ErrTransient),
+				err:    Transient(errors.New("ans dns: timeout")),
 			},
 			signers: []Signer{{Key: keyA, Certificate: certA}},
-			want:    want{method: "ans", err: "transient verification failure: ans dns: timeout", transient: true},
+			want:    want{method: "ans", err: "ans dns: timeout", transient: true},
 		},
 		{
 			name: "retry-after failure is transient and carries the time",
@@ -439,16 +437,14 @@ func TestProviderVerifyGuardsLookupContract(t *testing.T) {
 	}
 }
 
-func TestWellKnownLookupClassifiesNetworkFailures(t *testing.T) {
+func TestWellKnownLookupPropagatesTransientFailures(t *testing.T) {
 	tests := []struct {
 		name          string
 		err           error
 		wantTransient bool
 	}{
-		{name: "url error", err: &url.Error{Op: "Get", URL: "https://example.org/.well-known/jwks.json", Err: errors.New("connection refused")}, wantTransient: true},
-		{name: "deadline", err: fmt.Errorf("fetch: %w", context.DeadlineExceeded), wantTransient: true},
-		{name: "canceled", err: context.Canceled, wantTransient: true},
-		{name: "net error", err: &net.DNSError{Err: "no such host", Name: "example.org", IsNotFound: true}, wantTransient: true},
+		{name: "fetcher marks the failure transient", err: Transient(errors.New("JWKS at https://example.org returned HTTP 503")), wantTransient: true},
+		{name: "wrapped transient failure", err: fmt.Errorf("lookup: %w", Transient(context.DeadlineExceeded)), wantTransient: true},
 		{name: "malformed key set", err: errors.New("failed to parse JWK set"), wantTransient: false},
 	}
 
@@ -466,6 +462,27 @@ func TestWellKnownLookupClassifiesNetworkFailures(t *testing.T) {
 				t.Errorf("Transient = %v, want %v (error %q)", got.Transient, tt.wantTransient, got.Error)
 			}
 		})
+	}
+}
+
+func TestTransient(t *testing.T) {
+	cause := errors.New("dial tcp: connection refused")
+	err := Transient(cause)
+
+	if !errors.Is(err, ErrTransient) {
+		t.Error("errors.Is(Transient(err), ErrTransient) = false")
+	}
+
+	if !errors.Is(err, cause) {
+		t.Error("Transient(err) hides its cause from errors.Is")
+	}
+
+	if err.Error() != cause.Error() {
+		t.Errorf("Transient(err).Error() = %q, want the cause text %q", err.Error(), cause.Error())
+	}
+
+	if errors.Is(errors.New("other"), ErrTransient) {
+		t.Error("an unmarked error reports transient")
 	}
 }
 

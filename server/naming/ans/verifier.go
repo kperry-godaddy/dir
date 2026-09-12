@@ -259,7 +259,7 @@ func (n agentName) String() string {
 // are valid at the current time. It makes no network call.
 func (v *Verifier) filterCertificates(want agentName, evidence naming.Evidence) ([]*x509.Certificate, error) {
 	if len(evidence.Certificates) == 0 {
-		return nil, fail(stageCertificate, "no certificate attached to the record's signatures")
+		return nil, fail(stageCertificate, "no certificate whose key signed the record is attached")
 	}
 
 	filter := &certificateFilter{want: want, now: v.clock()}
@@ -515,12 +515,11 @@ func matchCertificates(payload *scitt.StatusTokenPayload, candidates []*x509.Cer
 // verifyReceipt fetches and verifies the agent's receipt and checks that the
 // logged event names this agent.
 //
-// The receipt signature covers the event payload only. Tree size, leaf index
+// The receipt signature covers the event and the protected header. Tree size, leaf index
 // and the inclusion path travel in the unsigned COSE header; the SDK checks
 // that they are well-formed and walks the path to a root it compares with
 // nothing. The receipt therefore proves that the log signed this event and
-// nothing about the event's position in the tree, so the position is logged
-// and not recorded.
+// nothing about the event's position in the tree.
 func (v *Verifier) verifyReceipt(ctx context.Context, client scitt.Client, keys scitt.KeyLookup, target badgeTarget, want agentName) error {
 	receiptBytes, err := client.FetchReceipt(ctx, target.AgentID)
 	if err != nil {

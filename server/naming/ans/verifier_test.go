@@ -378,7 +378,7 @@ func TestLookupKeysCertificateStage(t *testing.T) {
 			setup: func(f *fixture) {
 				f.evidence = naming.Evidence{}
 			},
-			wantErr:   "ans certificate: no certificate attached to the record's signatures",
+			wantErr:   "ans certificate: no certificate whose key signed the record is attached",
 			wantNoDNS: true,
 		},
 		{
@@ -1169,7 +1169,8 @@ func TestLookupKeysOverTLS(t *testing.T) {
 			setup: func(_ *fixture, l *tlsLog) {
 				l.redirect = true
 			},
-			wantErr: "ans status-token: transparency log returned HTTP 302",
+			wantErr:       "ans status-token: transparency log returned HTTP 302",
+			wantTransient: true,
 		},
 		{
 			name: "untrusted server certificate",

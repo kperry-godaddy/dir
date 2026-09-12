@@ -7,8 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
-	"net/url"
 	"slices"
 
 	"github.com/agntcy/dir/utils/logging"
@@ -243,29 +241,8 @@ func (l wellKnownLookup) Method() VerificationMethod {
 func (l wellKnownLookup) LookupKeys(ctx context.Context, name *ParsedName, _ Evidence) (*LookupResult, error) {
 	keys, err := l.fetcher.LookupKeysWithScheme(ctx, name.Domain, l.scheme)
 	if err != nil {
-		if isNetworkFailure(err) {
-			return nil, fmt.Errorf("%w: JWKS lookup failed: %w", ErrTransient, err)
-		}
-
 		return nil, fmt.Errorf("JWKS lookup failed: %w", err)
 	}
 
 	return &LookupResult{Keys: keys}, nil
-}
-
-// isNetworkFailure reports whether a JWKS fetch failed before the server
-// answered: a resolver, dial, TLS or deadline problem rather than a missing or
-// malformed key set.
-func isNetworkFailure(err error) bool {
-	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-		return true
-	}
-
-	if _, ok := errors.AsType[*url.Error](err); ok {
-		return true
-	}
-
-	_, ok := errors.AsType[net.Error](err)
-
-	return ok
 }

@@ -207,6 +207,8 @@ func TestGetRecordsNeedingVerification_ScheduleAndTTL(t *testing.T) {
 
 	future := time.Now().Add(30 * time.Minute)
 	due := time.Now().Add(-time.Minute)
+	fresh := time.Now().Add(-time.Minute)
+	stale := time.Now().Add(-2 * ttl)
 
 	tests := []struct {
 		name     string
@@ -260,7 +262,22 @@ func TestGetRecordsNeedingVerification_ScheduleAndTTL(t *testing.T) {
 		},
 		{
 			name: "verified row without a schedule is not selected before the ttl",
+			row:  &NameVerification{Status: VerificationStatusVerified, VerifiedAt: &fresh},
+			want: false,
+		},
+		{
+			name: "verified row whose verification time has passed the ttl is selected however fresh its update",
+			row:  &NameVerification{Status: VerificationStatusVerified, VerifiedAt: &stale},
+			want: true,
+		},
+		{
+			name: "verified row without a verification time is selected however fresh its update",
 			row:  &NameVerification{Status: VerificationStatusVerified},
+			want: true,
+		},
+		{
+			name: "pending row without a verification time or schedule is not selected before the ttl",
+			row:  &NameVerification{Status: VerificationStatusPending, Error: "transient: boom"},
 			want: false,
 		},
 		{

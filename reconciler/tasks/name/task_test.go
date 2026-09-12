@@ -830,6 +830,35 @@ func TestTransition(t *testing.T) {
 	}
 }
 
+// A verified row's retry never lands after its TTL, so the first run past the
+// TTL demotes it instead of leaving it served for the rest of a long backoff.
+func TestTransitionSchedulesVerifiedRowNoLaterThanTTL(t *testing.T) {
+	p := policy{ttl: taskTestTTL, interval: taskTestInterval}
+	verifiedAt := fixedNow.Add(time.Hour - taskTestTTL)
+
+	tests := []struct {
+		name   string
+		result *naming.Result
+	}{
+		{name: "doubling backoff", result: transientResult(dnsTimeoutText)},
+		{name: "retry-after from the breaker", result: retryAfterResult(errLookupDown.Error(), fixedNow.Add(2*time.Hour))},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			existing := existingRow(gormdb.VerificationStatusVerified, 6)
+			existing.VerifiedAt = &verifiedAt
+
+			got := transition(taskTestCID, existing, tt.result, fixedNow, p)
+
+			assert.Equal(t, outcomeTransient, got.kind)
+			assert.Equal(t, gormdb.VerificationStatusVerified, got.row.Status)
+			require.NotNil(t, got.row.NextAttemptAt)
+			assert.Equal(t, fixedNow.Add(time.Hour), *got.row.NextAttemptAt)
+		})
+	}
+}
+
 // Run loads the row once, calls Verify once and writes the transition once:
 // a create when there is no row, an update otherwise.
 func TestTask_Run_WritesTheTransitionOnce(t *testing.T) {

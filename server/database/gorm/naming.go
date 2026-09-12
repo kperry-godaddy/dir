@@ -186,8 +186,10 @@ func (d *DB) GetRecordsNeedingVerification(ttl time.Duration) ([]coretypes.Recor
 		Where("records.signed = ?", true).
 		Where("("+strings.Join(nameClauses, " OR ")+")", nameArgs...).
 		Where(`(nv.record_cid IS NULL
-			OR (nv.next_attempt_at IS NULL AND nv.updated_at < ?)
-			OR (nv.next_attempt_at IS NOT NULL AND nv.next_attempt_at <= ?))`, expiredBefore, now).
+			OR (nv.next_attempt_at IS NULL AND (nv.updated_at < ?
+				OR (nv.status = ? AND (nv.verified_at IS NULL OR nv.verified_at < ?))))
+			OR (nv.next_attempt_at IS NOT NULL AND nv.next_attempt_at <= ?))`,
+			expiredBefore, VerificationStatusVerified, expiredBefore, now).
 		Find(&records).Error
 	if err != nil {
 		return nil, fmt.Errorf("failed to get records needing verification: %w", err)

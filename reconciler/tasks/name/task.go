@@ -348,6 +348,10 @@ func transientStep(cid string, existing types.NameVerificationObject, result *na
 
 		if at := existing.GetVerifiedAt(); at != nil && now.Before(at.Add(p.ttl)) {
 			row.Status = gormdb.VerificationStatusVerified
+
+			if expiry := at.Add(p.ttl); nextAttemptAt.After(expiry) {
+				row.NextAttemptAt = &expiry
+			}
 		}
 	case gormdb.VerificationStatusFailed:
 		row.Error = existing.GetError()

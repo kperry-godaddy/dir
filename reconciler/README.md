@@ -114,6 +114,8 @@ Force re-verification of ANS rows on the next run after fixing a bad configurati
 DELETE FROM name_verifications WHERE method='ans' AND status IN ('failed','pending');
 ```
 
+When a release changes the stored `ans` details schema, upgrade the API server before the reconciler: the API server reads rows written by any earlier schema version but rejects newer ones.
+
 ### Signature Task
 
 The signature task verifies record signatures and caches results. It:

@@ -31,8 +31,8 @@ const (
 	// how long a record recorded as unavailable waits before its next attempt.
 	maxRetryDelay = 24 * time.Hour
 
-	// retryBaseDivisor halves the task interval for the first retry so it lands
-	// on the next run rather than one run late.
+	// retryBaseDivisor halves the task interval so the first retry lands on
+	// the next run.
 	retryBaseDivisor = 2
 
 	// pendingBudget is how long a record may stay pending before it is
@@ -82,7 +82,8 @@ func (t *Task) IsEnabled() bool {
 }
 
 // Run executes name verification: fetch records needing verification, then
-// verify each. It stops at the first record for which ctx is done.
+// verify each. It stops at the first record for which ctx is done; a stop is
+// not a failure of the run.
 func (t *Task) Run(ctx context.Context) error {
 	started := t.now()
 
@@ -105,9 +106,10 @@ func (t *Task) Run(ctx context.Context) error {
 
 	for i, r := range records {
 		if err := ctx.Err(); err != nil {
+			logger.Info("Name verification stopped early", "processed", i, "total", len(records), "reason", err)
 			summary.log(t.now().Sub(started))
 
-			return fmt.Errorf("name verification stopped after %d of %d records: %w", i, len(records), err)
+			return nil
 		}
 
 		summary.add(t.verifyRecord(ctx, r.GetCid(), r.GetName()))
@@ -142,7 +144,12 @@ func (t *Task) verifyRecord(ctx context.Context, cid, recordName string) outcome
 	if err != nil {
 		logger.Warn("Could not read the record's signatures", "cid", cid, "recordName", recordName, "error", err)
 
-		result := &naming.Result{Domain: parsed.Domain, Method: string(method), Error: unreadableSignaturesMessage, Transient: true}
+		message := unreadableSignaturesMessage
+		if errors.Is(err, errSignaturesCapped) {
+			message = err.Error()
+		}
+
+		result := &naming.Result{Domain: parsed.Domain, Method: string(method), Error: message, Transient: true}
 
 		return t.recordResult(ctx, cid, recordName, result, started)
 	}
@@ -160,9 +167,13 @@ func (t *Task) collectSigners(ctx context.Context, cid string) ([]naming.Signer,
 		return nil, fmt.Errorf("pull signatures: %w", err)
 	}
 
-	signers, err := certificateSigners(ctx, cid, sigs)
+	signers, capped, err := certificateSigners(ctx, cid, sigs)
 	if err != nil {
 		return nil, err
+	}
+
+	if capped && len(signers) == 0 {
+		return nil, errSignaturesCapped
 	}
 
 	keys, err := t.fetcher.PullPublicKeys(ctx, ref)
@@ -279,6 +290,7 @@ func (t *Task) logAttempt(cid, recordName string, result *naming.Result, row *go
 		"domain", result.Domain,
 		"method", row.Method,
 		"error", row.Error,
+		"cause", result.Error,
 		"transient", result.Transient,
 		"status", row.Status,
 		"elapsedMs", elapsed.Milliseconds(),
@@ -345,14 +357,6 @@ func transientStep(cid string, existing types.NameVerificationObject, result *na
 	case gormdb.VerificationStatusVerified:
 		row.Error = transientErr
 		row.Status = gormdb.VerificationStatusPending
-
-		if at := existing.GetVerifiedAt(); at != nil && now.Before(at.Add(p.ttl)) {
-			row.Status = gormdb.VerificationStatusVerified
-
-			if expiry := at.Add(p.ttl); nextAttemptAt.After(expiry) {
-				row.NextAttemptAt = &expiry
-			}
-		}
 	case gormdb.VerificationStatusFailed:
 		row.Error = existing.GetError()
 		row.Status = gormdb.VerificationStatusFailed

@@ -194,7 +194,7 @@ func TestCertificateSigners_BindsEverySignerKeyType(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			id := newTestIdentityWithKey(t, tc.key(t), signersTestSAN)
 
-			signers, err := certificateSigners(t.Context(), signersTestCID, []*signv1.Signature{signedBy(t, id)})
+			signers, _, err := certificateSigners(t.Context(), signersTestCID, []*signv1.Signature{signedBy(t, id)})
 			require.NoError(t, err)
 
 			require.Len(t, signers, 1)
@@ -394,7 +394,7 @@ func TestCertificateSigners(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			signers, err := certificateSigners(t.Context(), signersTestCID, tc.sigs(t))
+			signers, _, err := certificateSigners(t.Context(), signersTestCID, tc.sigs(t))
 			require.NoError(t, err)
 
 			require.Len(t, signers, len(tc.wantKeys))
@@ -413,6 +413,30 @@ func TestCertificateSigners_CanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	_, err := certificateSigners(ctx, signersTestCID, []*signv1.Signature{signedBy(t, victim)})
+	_, _, err := certificateSigners(ctx, signersTestCID, []*signv1.Signature{signedBy(t, victim)})
 	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestCertificateSignersReportsTheCap(t *testing.T) {
+	victim := newTestIdentity(t, signersTestSAN)
+
+	tests := []struct {
+		name       string
+		sigs       []*signv1.Signature
+		wantCapped bool
+		wantCount  int
+	}{
+		{name: "one real signature is not capped", sigs: []*signv1.Signature{signedBy(t, victim)}, wantCount: 1},
+		{name: "exactly the limit is not capped", sigs: junkSignatures(t, victim, maxSignaturesExamined), wantCapped: false},
+		{name: "one over the limit is capped", sigs: junkSignatures(t, victim, maxSignaturesExamined+1), wantCapped: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			signers, capped, err := certificateSigners(t.Context(), signersTestCID, tc.sigs)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantCapped, capped)
+			assert.Len(t, signers, tc.wantCount)
+		})
+	}
 }

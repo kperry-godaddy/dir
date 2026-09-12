@@ -611,13 +611,6 @@ func TestTransition(t *testing.T) {
 
 		return row
 	}
-	keptVerified := func(errMsg string, failures int, next *time.Time) *gormdb.NameVerification {
-		row := demoted(failures, next)
-		row.Status = gormdb.VerificationStatusVerified
-		row.Error = errMsg
-
-		return row
-	}
 
 	tests := []struct {
 		name     string
@@ -673,10 +666,10 @@ func TestTransition(t *testing.T) {
 			wantKind: outcomeTransient,
 		},
 		{
-			name:     "transient on a verified row before its ttl keeps it verified",
+			name:     "transient on a verified row makes it pending and keeps what it verified",
 			existing: existingRow(gormdb.VerificationStatusVerified, 0),
 			result:   transientResult(dnsTimeoutText),
-			want:     keptVerified("transient: ans dns: lookup timed out", 1, at(taskTestInterval/2)),
+			want:     demoted(1, at(taskTestInterval/2)),
 			wantKind: outcomeTransient,
 		},
 		{
@@ -730,10 +723,15 @@ func TestTransition(t *testing.T) {
 			wantKind: outcomeTransient,
 		},
 		{
-			name:     "retry-after on a verified row keeps the verdict without a strike",
+			name:     "retry-after on a verified row makes it pending without a strike",
 			existing: existingRow(gormdb.VerificationStatusVerified, 0),
 			result:   retryAfter,
-			want:     keptVerified("transient: transport down", 0, at(10*time.Minute)),
+			want: func() *gormdb.NameVerification {
+				row := demoted(0, at(10*time.Minute))
+				row.Error = "transient: transport down"
+
+				return row
+			}(),
 			wantKind: outcomeTransient,
 		},
 		{
@@ -830,35 +828,6 @@ func TestTransition(t *testing.T) {
 	}
 }
 
-// A verified row's retry never lands after its TTL, so the first run past the
-// TTL demotes it instead of leaving it served for the rest of a long backoff.
-func TestTransitionSchedulesVerifiedRowNoLaterThanTTL(t *testing.T) {
-	p := policy{ttl: taskTestTTL, interval: taskTestInterval}
-	verifiedAt := fixedNow.Add(time.Hour - taskTestTTL)
-
-	tests := []struct {
-		name   string
-		result *naming.Result
-	}{
-		{name: "doubling backoff", result: transientResult(dnsTimeoutText)},
-		{name: "retry-after from the breaker", result: retryAfterResult(errLookupDown.Error(), fixedNow.Add(2*time.Hour))},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			existing := existingRow(gormdb.VerificationStatusVerified, 6)
-			existing.VerifiedAt = &verifiedAt
-
-			got := transition(taskTestCID, existing, tt.result, fixedNow, p)
-
-			assert.Equal(t, outcomeTransient, got.kind)
-			assert.Equal(t, gormdb.VerificationStatusVerified, got.row.Status)
-			require.NotNil(t, got.row.NextAttemptAt)
-			assert.Equal(t, fixedNow.Add(time.Hour), *got.row.NextAttemptAt)
-		})
-	}
-}
-
 // Run loads the row once, calls Verify once and writes the transition once:
 // a create when there is no row, an update otherwise.
 func TestTask_Run_WritesTheTransitionOnce(t *testing.T) {
@@ -872,7 +841,7 @@ func TestTask_Run_WritesTheTransitionOnce(t *testing.T) {
 		wantStatus string
 	}{
 		{name: "transient with no row is created pending", lookupErr: errDNSTimeout, wantCreate: true, wantStatus: gormdb.VerificationStatusPending},
-		{name: "transient on a verified row is updated in place", existing: existingRow(gormdb.VerificationStatusVerified, 0), lookupErr: errDNSTimeout, wantStatus: gormdb.VerificationStatusVerified},
+		{name: "transient on a verified row is updated in place as pending", existing: existingRow(gormdb.VerificationStatusVerified, 0), lookupErr: errDNSTimeout, wantStatus: gormdb.VerificationStatusPending},
 		{name: "verified result on a pending row is updated", existing: existingRow(gormdb.VerificationStatusPending, 5), wantStatus: gormdb.VerificationStatusVerified},
 		{name: "terminal result with no row is created failed", lookupErr: errAgentRevoke, wantCreate: true, wantStatus: gormdb.VerificationStatusFailed},
 	}
@@ -949,9 +918,7 @@ func TestTask_Run_StopsBeforeEachRecordOnceCanceled(t *testing.T) {
 
 	task := newTestTask(t, Config{Enabled: true}, db, fetcher, ansProvider(lookup))
 
-	err := task.Run(ctx)
-	require.ErrorIs(t, err, context.Canceled)
-	require.ErrorContains(t, err, "stopped after 0 of 2 records")
+	require.NoError(t, task.Run(ctx))
 	assert.Equal(t, 0, db.writes())
 	assert.Equal(t, 0, lookup.calls)
 	assert.Equal(t, 0, fetcher.sigCalls)
@@ -975,8 +942,7 @@ func TestTask_Run_CancellationDuringARecordWritesNothing(t *testing.T) {
 	task := newTestTask(t, Config{Enabled: true}, db, fetcher, ansProvider(lookup))
 
 	err := task.Run(ctx)
-	require.ErrorIs(t, err, context.Canceled)
-	require.ErrorContains(t, err, "stopped after 1 of 2 records")
+	require.NoError(t, err)
 	assert.Equal(t, 0, db.writes())
 	assert.Equal(t, 1, lookup.calls)
 }
@@ -1053,7 +1019,7 @@ func TestCertificateSigners_MatchesClientPayloadShape(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEmpty(t, raw)
 
-	signers, err := certificateSigners(t.Context(), taskTestCID, []*signv1.Signature{sig})
+	signers, _, err := certificateSigners(t.Context(), taskTestCID, []*signv1.Signature{sig})
 	require.NoError(t, err)
 	require.Len(t, signers, 1)
 
@@ -1067,4 +1033,22 @@ func TestFailedRow_DefaultMessage(t *testing.T) {
 
 	assert.Equal(t, gormdb.VerificationStatusFailed, row.Status)
 	assert.Equal(t, "verification failed", row.Error)
+}
+
+// A record buried under more signatures than the task examines, none of them
+// bound to an attached certificate, is left pending rather than failed: the
+// flood may be an attack on a record that is otherwise fine.
+func TestTask_VerifyRecord_SignatureFloodWithoutBoundCertificateIsPending(t *testing.T) {
+	victim := newTestIdentity(t, signersTestSAN)
+	lookup := &fakeLookup{keys: []naming.PublicKey{publishedKey(t, victim)}}
+	fetcher := &fakeFetcher{signatures: junkSignatures(t, victim, maxSignaturesExamined+1)}
+	db := &fakeDB{records: []coretypes.Record{&fakeRecord{cid: taskTestCID, name: taskTestANSName}}}
+
+	task := newTestTask(t, Config{Enabled: true}, db, fetcher, ansProvider(lookup))
+
+	require.NoError(t, task.Run(t.Context()))
+	require.Len(t, db.created, 1)
+	assert.Equal(t, gormdb.VerificationStatusPending, db.created[0].GetStatus())
+	assert.Equal(t, "transient: "+errSignaturesCapped.Error(), db.created[0].GetError())
+	assert.Equal(t, 0, lookup.calls)
 }

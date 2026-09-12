@@ -20,8 +20,9 @@ const (
 	VerificationStatusVerified = "verified"
 	VerificationStatusFailed   = "failed"
 
-	// VerificationStatusPending marks a record that has never reached a
-	// verdict because every attempt so far failed transiently.
+	// VerificationStatusPending marks a record with no verdict to serve: it has
+	// not verified yet, or its verified verdict passed the TTL while a
+	// dependency was down.
 	VerificationStatusPending = "pending"
 )
 
@@ -38,7 +39,7 @@ type NameVerification struct {
 	Method    string         `gorm:"not null"`                               // "wellknown" or "ans"
 	KeyID     string         // matched key ID (if successful)
 	Status    string         `gorm:"not null;index"` // "verified", "failed" or "pending"
-	Error     string         // error message (if failed or pending)
+	Error     string         // why the last attempt did not verify
 
 	Details    string     `gorm:"type:text"` // method-specific JSON recorded with a verified result
 	VerifiedAt *time.Time // when the row last verified: set by a verified verdict, kept through pending, cleared by a failed verdict

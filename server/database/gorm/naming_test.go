@@ -112,7 +112,10 @@ func TestNameVerification_RoundTripsEveryColumn(t *testing.T) {
 	require.NotNil(t, got.GetNextAttemptAt())
 	assert.WithinDuration(t, nextAttemptAt, *got.GetNextAttemptAt(), time.Second)
 	assert.False(t, got.GetCreatedAt().IsZero())
-	assert.False(t, got.GetUpdatedAt().IsZero())
+	row, ok := got.(*NameVerification)
+	require.True(t, ok)
+
+	assert.False(t, row.UpdatedAt.IsZero())
 }
 
 func TestUpdateNameVerification_WritesEveryColumnAndClearsNilOnes(t *testing.T) {

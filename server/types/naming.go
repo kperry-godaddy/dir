@@ -5,20 +5,8 @@ package types
 
 import "time"
 
-// NameVerificationRetryState is the retry schedule of a name verification.
-type NameVerificationRetryState interface {
-	// GetConsecutiveFailures counts transient failures since the last verdict.
-	GetConsecutiveFailures() int
-
-	// GetNextAttemptAt is the scheduled retry after a transient failure, nil
-	// when the row is governed by the TTL alone.
-	GetNextAttemptAt() *time.Time
-}
-
 // NameVerificationObject represents a name verification result.
 type NameVerificationObject interface {
-	NameVerificationRetryState
-
 	GetRecordCID() string
 	GetMethod() string
 	GetKeyID() string
@@ -34,5 +22,11 @@ type NameVerificationObject interface {
 	GetVerifiedAt() *time.Time
 
 	GetCreatedAt() time.Time
-	GetUpdatedAt() time.Time
+
+	// GetConsecutiveFailures counts transient failures since the last verdict.
+	GetConsecutiveFailures() int
+
+	// GetNextAttemptAt is the scheduled retry after a transient failure, nil
+	// when the row is governed by the TTL alone.
+	GetNextAttemptAt() *time.Time
 }

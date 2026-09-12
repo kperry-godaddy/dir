@@ -30,6 +30,12 @@ const (
 
 var maxEncodedCertificateSize = base64.StdEncoding.EncodedLen(cosign.MaxCertificateDERSize)
 
+// errSignaturesCapped is stored when a record carries more signatures than the
+// task examines and none of the examined ones was signed with an attached
+// certificate, so the verdict is withheld instead of failing a record that may
+// be under a referrer flood.
+var errSignaturesCapped = fmt.Errorf("none of the first %d signatures was made with an attached certificate; the record carries more", maxSignaturesExamined)
+
 // certificateSigners returns the record's certificate-bound signers: for each
 // key-based signature carrying a certificate whose key produced the signature
 // over the record CID, the certificate and its key. A copied certificate with
@@ -39,8 +45,9 @@ var maxEncodedCertificateSize = base64.StdEncoding.EncodedLen(cosign.MaxCertific
 //
 // Duplicated certificates are reported once, in the order of their first
 // signature. At most maxSignaturesExamined signatures are examined.
-func certificateSigners(ctx context.Context, cid string, sigs []*signv1.Signature) ([]naming.Signer, error) {
-	if len(sigs) > maxSignaturesExamined {
+func certificateSigners(ctx context.Context, cid string, sigs []*signv1.Signature) ([]naming.Signer, bool, error) {
+	capped := len(sigs) > maxSignaturesExamined
+	if capped {
 		logger.Warn("Examining only the first signatures of the record",
 			"cid", cid, "signatures", len(sigs), "limit", maxSignaturesExamined)
 
@@ -53,7 +60,7 @@ func certificateSigners(ctx context.Context, cid string, sigs []*signv1.Signatur
 
 	for _, sig := range sigs {
 		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("certificate signers: %w", err)
+			return nil, capped, fmt.Errorf("certificate signers: %w", err)
 		}
 
 		cert, ok := boundCertificate(cid, sig)
@@ -77,7 +84,7 @@ func certificateSigners(ctx context.Context, cid string, sigs []*signv1.Signatur
 		signers = append(signers, naming.Signer{Key: key, Certificate: cert.Raw})
 	}
 
-	return signers, nil
+	return signers, capped, nil
 }
 
 // boundCertificate parses the certificate attached to a key-based signature

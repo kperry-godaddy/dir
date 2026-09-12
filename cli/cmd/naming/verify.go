@@ -149,7 +149,6 @@ func verificationFields(cid string, v *namingv1.Verification) map[string]any {
 		fields["domain"] = av.GetAgentHost()
 		fields["method"] = "ans"
 		fields["key_id"] = av.GetCertFingerprint()
-		fields["verified_at"] = v.GetVerifiedAt().AsTime().Format(time.RFC3339)
 		fields["ans_name"] = av.GetAnsName()
 		fields["agent_id"] = av.GetAgentId()
 		fields["agent_host"] = av.GetAgentHost()
@@ -157,6 +156,10 @@ func verificationFields(cid string, v *namingv1.Verification) map[string]any {
 		fields["receipt_url"] = av.GetReceiptUrl()
 		fields["cert_fingerprint"] = av.GetCertFingerprint()
 		fields["agent_status"] = av.GetAgentStatus()
+
+		if v.GetVerifiedAt() != nil {
+			fields["verified_at"] = v.GetVerifiedAt().AsTime().Format(time.RFC3339)
+		}
 
 	default:
 		fields["message"] = "the server verified this name with a method this dirctl does not know; upgrade dirctl to see the details"

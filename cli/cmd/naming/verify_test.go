@@ -109,6 +109,30 @@ func TestVerificationFields(t *testing.T) {
 			},
 		},
 		{
+			name: "ans verification without an envelope time omits verified_at",
+			verification: namingv1.NewAnsVerification(&namingv1.AnsVerification{
+				AnsName:         "ans://v1.0.0.agent.example.com",
+				AgentId:         "agent-1",
+				AgentHost:       "agent.example.com",
+				CertFingerprint: "SHA256:abcd",
+				AgentStatus:     "ACTIVE",
+			}),
+			want: map[string]any{
+				"cid":              testCID,
+				"verified":         true,
+				"domain":           "agent.example.com",
+				"method":           "ans",
+				"key_id":           "SHA256:abcd",
+				"ans_name":         "ans://v1.0.0.agent.example.com",
+				"agent_id":         "agent-1",
+				"agent_host":       "agent.example.com",
+				"log_url":          "",
+				"receipt_url":      "",
+				"cert_fingerprint": "SHA256:abcd",
+				"agent_status":     "ACTIVE",
+			},
+		},
+		{
 			name:         "unknown arm",
 			verification: withVerifiedAt(withUnknownArm(&namingv1.Verification{}), verifiedAt),
 			want: map[string]any{

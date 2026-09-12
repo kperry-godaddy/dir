@@ -11,7 +11,6 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/json"
 	"net/url"
 
 	"github.com/agentnameservice/ans-sdk-go/verify"
@@ -44,8 +43,7 @@ func buildResult(want agentName, target badgeTarget, token *scitt.VerifiedStatus
 		return nil, failWith(stageReceipt, err, "cannot build the receipt URL")
 	}
 
-	encoded, err := json.Marshal(details.Details{
-		Version:     details.Version,
+	encoded, err := details.Encode(details.Details{
 		AnsName:     want.String(),
 		AgentHost:   want.host,
 		AgentID:     target.AgentID,

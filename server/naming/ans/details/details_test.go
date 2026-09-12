@@ -73,6 +73,34 @@ func TestDecode(t *testing.T) {
 	}
 }
 
+func TestEncodeStampsVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		details Details
+	}{
+		{name: "unset version", details: Details{AnsName: "ans://v1.0.0.agent.example.com"}},
+		{name: "stale version", details: Details{Version: 99, AnsName: "ans://v1.0.0.agent.example.com"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			encoded, err := Encode(tt.details)
+			if err != nil {
+				t.Fatalf("Encode() error = %v", err)
+			}
+
+			got, err := Decode(encoded)
+			if err != nil {
+				t.Fatalf("Decode() error = %v", err)
+			}
+
+			if got.Version != Version || got.AnsName != tt.details.AnsName {
+				t.Errorf("Decode(Encode()) = %+v, want version %d and the same name", *got, Version)
+			}
+		})
+	}
+}
+
 func TestJSONKeys(t *testing.T) {
 	encoded, err := json.Marshal(Details{Version: Version})
 	if err != nil {

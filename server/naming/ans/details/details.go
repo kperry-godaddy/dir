@@ -40,6 +40,19 @@ type Details struct {
 	AgentStatus string `json:"agentStatus"`
 }
 
+// Encode renders details for persistence, stamped with the current schema
+// version.
+func Encode(d Details) ([]byte, error) {
+	d.Version = Version
+
+	encoded, err := json.Marshal(d)
+	if err != nil {
+		return nil, fmt.Errorf("ans details: %w", err)
+	}
+
+	return encoded, nil
+}
+
 // Decode parses persisted details. Rows written by an older schema version
 // decode with their known fields; rows written by a newer version are
 // rejected.

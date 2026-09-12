@@ -98,6 +98,12 @@ func runCommand(cmd *cobra.Command, source io.Reader) error {
 		return fmt.Errorf("failed to load OASF: %w", err)
 	}
 
+	if opts.Sign {
+		if err := signcmd.CheckFlags(); err != nil {
+			return err
+		}
+	}
+
 	var recordRef *corev1.RecordRef
 
 	// Use the client's Push method to send the record

@@ -748,6 +748,11 @@ reconciler:
     tag: latest
     pullPolicy: IfNotPresent
 
+  # Extra volumes and mounts for the reconciler pod only, for example a Secret
+  # holding the CA bundle that reconciler.config.name.ans.ca_file points at.
+  extraVolumes: []
+  extraVolumeMounts: []
+
   # Azure OpenAI credentials for the scan task's LLM-backed scanners.
   # These are injected as plain process environment variables into the
   # reconciler container; the scanner subprocesses (mcp-scanner / skill-scanner)
@@ -862,17 +867,17 @@ reconciler:
       #   timeout: "10s"
       #   dns_server: ""
       #   # PEM file added to the system roots for transparency-log connections.
-      #   # Mount it from a Secret with the chart-level extraVolumes and
-      #   # extraVolumeMounts, which both the apiserver and the reconciler
-      #   # pods render:
-      #   #   extraVolumes:
-      #   #     - name: ans-log-ca
-      #   #       secret:
-      #   #         secretName: ans-log-ca
-      #   #   extraVolumeMounts:
-      #   #     - name: ans-log-ca
-      #   #       mountPath: /etc/agntcy/ans
-      #   #       readOnly: true
+      #   # Mount it from a Secret with reconciler.extraVolumes and
+      #   # reconciler.extraVolumeMounts, which only the reconciler pod renders:
+      #   #   reconciler:
+      #   #     extraVolumes:
+      #   #       - name: ans-log-ca
+      #   #         secret:
+      #   #           secretName: ans-log-ca
+      #   #     extraVolumeMounts:
+      #   #       - name: ans-log-ca
+      #   #         mountPath: /etc/agntcy/ans
+      #   #         readOnly: true
       #   ca_file: "/etc/agntcy/ans/ca.pem"
 
     # Signature task configuration

@@ -401,10 +401,9 @@ func TestResolveCertificate(t *testing.T) {
 			wantWarning: "Warning: certificate " + certificateFingerprint(expired) + " expired at 2026-09-11T11:00:00Z",
 		},
 		{
-			name:        "chain warns about each certificate outside its validity",
-			options:     Options{Key: "cosign.key", Certificate: chainPath},
-			want:        string(append(certificatePEM(cert), certificatePEM(expired)...)),
-			wantWarning: "Warning: certificate " + certificateFingerprint(expired) + " expired at",
+			name:    "chain with a valid certificate does not warn about the expired one",
+			options: Options{Key: "cosign.key", Certificate: chainPath},
+			want:    string(append(certificatePEM(cert), certificatePEM(expired)...)),
 		},
 	}
 
@@ -1047,5 +1046,39 @@ func TestRunCommandRequiresClient(t *testing.T) {
 	err := runCommand(cmd, "bafyreib-record-cid")
 	if err == nil || !strings.Contains(err.Error(), "failed to get client from context") {
 		t.Fatalf("runCommand() error = %v, want the missing-client error", err)
+	}
+}
+
+func TestCheckOptions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		options Options
+		wantErr string
+	}{
+		{name: "key alone", options: Options{Key: "cosign.key"}},
+		{name: "key with certificate", options: Options{Key: "cosign.key", Certificate: "cert.pem"}},
+		{name: "oidc without certificate", options: Options{OIDCToken: "token"}},
+		{name: "certificate without key", options: Options{Certificate: "cert.pem"}, wantErr: "--certificate requires --key"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := checkOptions(tt.options)
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("checkOptions() error = %v", err)
+				}
+
+				return
+			}
+
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("checkOptions() error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
 	}
 }

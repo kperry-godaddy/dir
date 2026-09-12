@@ -134,17 +134,17 @@ The reconciler verifies an `ans://` record when all of the following hold:
   explicitly accepts fetching them over TLS from the trusted hosts.
 - The log's signed status token names the agent id and the ANS name, reports status
   `ACTIVE`, `WARNING`, or `DEPRECATED`, and attests the attached certificate's fingerprint.
-- The log serves a signed receipt for an event of the same agent id and ANS name (the log's
-  latest sealed event for the agent).
+- The log serves a signed receipt for an event of the same agent id and ANS name.
 
-The receipt check has a known limit: the receipt signature covers the event only; tree
-size, leaf index and inclusion path are unsigned header data checked for well-formedness
-and not compared with any published checkpoint, so the receipt proves the log signed this
-event and nothing about its position. The log answering 503 because the receipt is not yet
+The receipt check has a known limit: the receipt signature covers the event and the
+protected header; tree size, leaf index and inclusion path are unsigned header data checked
+for well-formedness and not compared with any published checkpoint, so the receipt proves
+the log signed this event and nothing about its position. The log answering 503 because the receipt is not yet
 available is a transient failure.
 
-A verified record keeps its verdict through transient failures (DNS timeouts, an unreachable
-log) until its TTL; after that it is pending until a verdict is reached. Terminal failures
+A verified record is served until its TTL and re-checked only then. When that re-check fails
+transiently (DNS timeouts, an unreachable log) the record is pending until a verdict is
+reached, still carrying what it last verified. Terminal failures
 such as a revoked agent or an unattested certificate mark the record failed until the
 re-check after `name.ttl`. After the identity certificate is renewed, re-sign the record
 with the new certificate; otherwise verification fails at the first re-check past the old

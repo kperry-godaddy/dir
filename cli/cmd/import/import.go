@@ -63,6 +63,10 @@ func runImport(cmd *cobra.Command) error {
 	}
 
 	if opts.Sign {
+		if err := signcmd.CheckFlags(); err != nil {
+			return fmt.Errorf("invalid signing flags: %w", err)
+		}
+
 		opts.SignFunc = func(ctx context.Context, cid string) error {
 			sig, err := signcmd.Sign(ctx, c, cid, cmd.ErrOrStderr())
 			if err != nil {

@@ -130,6 +130,20 @@ func Sign(ctx context.Context, c *client.Client, recordCID string, stderr io.Wri
 	return signRecord(ctx, c, recordCID, *opts, stderr)
 }
 
+// CheckFlags reports a flag-bound signing option combination that can never
+// sign, so a command can refuse before it pushes anything.
+func CheckFlags() error {
+	return checkOptions(*opts)
+}
+
+func checkOptions(o Options) error {
+	if o.Certificate != "" && o.Key == "" {
+		return errors.New("--certificate requires --key: a certificate can only be attached to a key-based signature")
+	}
+
+	return nil
+}
+
 func signRecord(ctx context.Context, c *client.Client, recordCID string, o Options, stderr io.Writer) (*signv1.Signature, error) {
 	provider, err := signProvider(o, stderr)
 	if err != nil {
@@ -154,10 +168,11 @@ func signRecord(ctx context.Context, c *client.Client, recordCID string, o Optio
 // signProvider builds the signing request for the configured options: a key
 // reference, a pre-issued OIDC token, or an interactive OIDC login.
 func signProvider(o Options, stderr io.Writer) (*signv1.SignRequestProvider, error) {
-	switch {
-	case o.Certificate != "" && o.Key == "":
-		return nil, errors.New("--certificate requires --key: a certificate can only be attached to a key-based signature")
+	if err := checkOptions(o); err != nil {
+		return nil, err
+	}
 
+	switch {
 	case o.Key != "":
 		return keyProvider(o, stderr)
 
@@ -221,8 +236,9 @@ func oidcProvider(o Options, token string) *signv1.SignRequestProvider {
 }
 
 // resolveCertificate reads the --certificate PEM bundle and returns it, or ""
-// when none was requested. Certificates outside their validity period at now
-// are reported on stderr before any signing or password prompt.
+// when none was requested. When no certificate in the bundle is valid at now,
+// each one is reported on stderr before any signing or password prompt; the
+// client attaches a valid one when there is any.
 func resolveCertificate(o Options, now time.Time, stderr io.Writer) (string, error) {
 	if o.Certificate == "" {
 		return "", nil
@@ -238,10 +254,19 @@ func resolveCertificate(o Options, now time.Time, stderr io.Writer) (string, err
 		return "", fmt.Errorf("certificate file %q: %w", o.Certificate, err)
 	}
 
+	warnings := make([]string, 0, len(certs))
+
 	for _, cert := range certs {
-		if warning := certificateValidityWarning(cert, now); warning != "" {
-			warn(stderr, warning)
+		warning := certificateValidityWarning(cert, now)
+		if warning == "" {
+			return string(data), nil
 		}
+
+		warnings = append(warnings, warning)
+	}
+
+	for _, warning := range warnings {
+		warn(stderr, warning)
 	}
 
 	return string(data), nil

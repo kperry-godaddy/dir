@@ -33,7 +33,8 @@ message Signature {
   // signing may store any X.509 certificate for the signing key (for
   // example an Agent Name Service identity certificate); signature
   // verification selects the key path by content_bundle being empty, not
-  // by this field.
+  // by this field. A certificate on a key-based signature is trusted only
+  // after the signature verifies with the certificate's key.
   string certificate = 5;
 
   // Type of the signature content bundle.

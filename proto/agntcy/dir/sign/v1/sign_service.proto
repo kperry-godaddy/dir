@@ -128,8 +128,10 @@ message SignWithKey {
   // Unlike private_key, this field accepts no file, URL, or KMS references.
   // A single certificate or a chain may be given; the certificate whose
   // public key matches private_key is attached to Signature.certificate as
-  // base64-encoded DER and the others are ignored. Signing fails when no
-  // certificate matches. Not used with OIDC signing.
+  // base64-encoded DER and the others are ignored. When several match, one
+  // that is currently valid is preferred. Signing fails when no certificate
+  // matches or when the attached certificate's DER exceeds 16 KiB, the bound
+  // verifiers apply. Not used with OIDC signing.
   optional string certificate = 3;
 }
 

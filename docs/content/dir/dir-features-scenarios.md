@@ -237,7 +237,7 @@ When verification succeeds, you'll receive a response like:
   "cid": "bafyreib...",
   "verified": true,
   "domain": "example.com",
-  "method": "jwks",
+  "method": "wellknown",
   "key_id": "key-1",
   "verified_at": "2026-01-21T10:30:00Z"
 }

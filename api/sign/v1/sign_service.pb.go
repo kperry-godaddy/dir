@@ -391,8 +391,10 @@ type SignWithKey struct {
 	// Unlike private_key, this field accepts no file, URL, or KMS references.
 	// A single certificate or a chain may be given; the certificate whose
 	// public key matches private_key is attached to Signature.certificate as
-	// base64-encoded DER and the others are ignored. Signing fails when no
-	// certificate matches. Not used with OIDC signing.
+	// base64-encoded DER and the others are ignored. When several match, one
+	// that is currently valid is preferred. Signing fails when no certificate
+	// matches or when the attached certificate's DER exceeds 16 KiB, the bound
+	// verifiers apply. Not used with OIDC signing.
 	Certificate   *string `protobuf:"bytes,3,opt,name=certificate,proto3,oneof" json:"certificate,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

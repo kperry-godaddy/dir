@@ -834,7 +834,7 @@ Fetch and import records from registries or local sources.
 | `--force` | - | Force reimport of existing records (skip deduplication) | No | false |
 | `--sign` | - | Sign records after pushing (uses OIDC by default) | No | false |
 | `--key` | - | Path to private key file for signing (requires `--sign`) | No | - |
-| `--certificate` | - | PEM file with the X.509 certificate, or chain, for `--key`; only the certificate matching the key is attached (requires `--key`) | No | - |
+| `--certificate` | - | PEM file with the X.509 certificate, or chain, for `--key`; only the certificate matching the key is attached (requires `--sign` and `--key`) | No | - |
 | `--oidc-token` | - | OIDC token for non-interactive signing (requires `--sign`) | No | - |
 | `--fulcio-url` | - | Sigstore Fulcio URL (requires `--sign`) | No | `https://fulcio.sigstore.dev` |
 | `--rekor-url` | - | Sigstore Rekor URL (requires `--sign`) | No | `https://rekor.sigstore.dev` |
@@ -1551,9 +1551,9 @@ cosign command and `dirctl sign`.
 
 `--certificate <file>` attaches the X.509 certificate, or chain, that belongs to `--key`;
 only the certificate matching the key is attached to the signature. `ans://` names need it.
-Certificates outside their validity period are warned about on stderr before signing, and
-the command prints the attached certificate's `certificate_fingerprint` (`SHA256:<hex>`,
-the same form the ANS transparency log reports).
+The command prints the attached certificate's `certificate_fingerprint` (`SHA256:<hex>`,
+the same form the ANS transparency log reports) and warns on stderr when that certificate
+is outside its validity period, since the reconciler will reject it.
 
 The `--key` flag accepts PEM content, a local file, an HTTP(S) URL, an environment
 variable reference, or a KMS URI. The supported KMS URI formats are:
@@ -1631,7 +1631,7 @@ Verifies that a record's signing key is authorized by the domain claimed in its 
     "cid": "bafyreib...",
     "verified": true,
     "domain": "cisco.com",
-    "method": "jwks",
+    "method": "wellknown",
     "key_id": "key-1",
     "verified_at": "2026-01-21T10:30:00Z"
     }

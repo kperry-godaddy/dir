@@ -142,13 +142,16 @@ for well-formedness and not compared with any published checkpoint, so the recei
 the log signed this event and nothing about its position. The log answering 503 because the receipt is not yet
 available is a transient failure.
 
-A verified record is served until its TTL and re-checked only then. When that re-check fails
-transiently (DNS timeouts, an unreachable log) the record is pending until a verdict is
-reached, still carrying what it last verified. Terminal failures
-such as a revoked agent or an unattested certificate mark the record failed until the
-re-check after `name.ttl`. After the identity certificate is renewed, re-sign the record
-with the new certificate; otherwise verification fails at the first re-check past the old
-certificate's `NotAfter`.
+A verified record is served until its TTL and re-checked one reconciler interval before
+that, so it is re-verified before the API stops serving it. A transient failure (DNS
+timeouts, an unreachable log) at a re-check within the TTL leaves it verified with a retry
+scheduled; after the TTL it leaves the record pending, which the API does not serve as
+verified, until a verdict is reached. Terminal failures such as a revoked agent or an
+unattested certificate mark the record failed until the re-check after `name.ttl`, so a
+revocation is noticed within one TTL; the reconciler README shows how to force an earlier
+re-check. After the identity certificate is renewed, re-sign the record with the new
+certificate; otherwise verification fails at the first re-check past the old certificate's
+`NotAfter`.
 
 The method is configured on the reconciler under `name.ans.*` (`reconciler.name.ans.*` in
 daemon mode, `reconciler.config.name.ans.*` in the Helm chart). Raising `timeout` also

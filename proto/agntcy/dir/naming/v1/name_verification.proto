@@ -8,14 +8,14 @@ package agntcy.dir.naming.v1;
 import "google/protobuf/timestamp.proto";
 
 // Verification represents the result of verifying a record's name ownership.
-// It uses a oneof to support different verification types.
+// It uses a oneof to support different verification types; a new method adds
+// a member to info.
 message Verification {
   oneof info {
     // Domain verification details.
     DomainVerification domain = 1;
     // Agent Name Service verification details.
     AnsVerification ans = 2;
-    // Future verification types can be added here.
   }
 
   // When the verification was performed, whichever method verified the name.
@@ -27,7 +27,8 @@ message Verification {
 // record's ans:// name. The key is proven through the agent's identity
 // certificate, attested by the agent's transparency log.
 message AnsVerification {
-  // The ANS name that was verified (e.g., "ans://v1.0.0.agent.example.com").
+  // The ANS name that was verified, without the record's path
+  // (e.g., "ans://v1.0.0.agent.example.com").
   string ans_name = 1;
 
   // The agent identifier in the transparency log.
@@ -64,6 +65,7 @@ message DomainVerification {
   // This is the "id" field from the well-known file.
   string key_id = 3;
 
-  // When the verification was performed.
+  // When the verification was performed. Mirrors Verification.verified_at for
+  // clients that predate it; Verification.verified_at is authoritative.
   google.protobuf.Timestamp verified_at = 4;
 }

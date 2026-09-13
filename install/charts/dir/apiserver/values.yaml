@@ -862,10 +862,14 @@ reconciler:
     name:
       enabled: true
       interval: "1h"
+      # ttl: "168h"
+      # record_timeout: "30s"
       # Agent Name Service (ANS) verification for records named
       # ans://vX.Y.Z.host[/path], signed with the agent's ANS identity key and
       # certificate. root_keys lines come from each log's /root-keys. Every key
-      # below is set as reconciler.config.name.ans.<key>.
+      # below is set as reconciler.config.name.ans.<key>. An invalid ans block
+      # stops the reconciler at startup; the log line "Reconciler failed" names
+      # the cause. timeout must stay shorter than record_timeout.
       # ans:
       #   enabled: false
       #   trusted_log_hosts:
@@ -876,8 +880,12 @@ reconciler:
       #   timeout: "10s"
       #   dns_server: ""
       #   # PEM file added to the system roots for transparency-log connections.
-      #   # Mount it from a Secret with reconciler.extraVolumes and
-      #   # reconciler.extraVolumeMounts, which only the reconciler pod renders:
+      #   # Create the Secret first, with a key named after the file:
+      #   #   kubectl create secret generic ans-log-ca --from-file=ca.pem=<log-ca.pem>
+      #   # then mount it with reconciler.extraVolumes and
+      #   # reconciler.extraVolumeMounts, which only the reconciler pod renders.
+      #   # The file is read at startup: after replacing the Secret, restart the
+      #   # reconciler (kubectl rollout restart deployment/<release>-reconciler).
       #   #   reconciler:
       #   #     extraVolumes:
       #   #       - name: ans-log-ca

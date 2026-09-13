@@ -50,7 +50,8 @@ type Signature struct {
 	// signing may store any X.509 certificate for the signing key (for
 	// example an Agent Name Service identity certificate); signature
 	// verification selects the key path by content_bundle being empty, not
-	// by this field.
+	// by this field. A certificate on a key-based signature is trusted only
+	// after the signature verifies with the certificate's key.
 	Certificate string `protobuf:"bytes,5,opt,name=certificate,proto3" json:"certificate,omitempty"`
 	// Type of the signature content bundle.
 	ContentType string `protobuf:"bytes,6,opt,name=content_type,json=contentType,proto3" json:"content_type,omitempty"`

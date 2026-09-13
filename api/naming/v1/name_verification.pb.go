@@ -26,7 +26,8 @@ const (
 )
 
 // Verification represents the result of verifying a record's name ownership.
-// It uses a oneof to support different verification types.
+// It uses a oneof to support different verification types; a new method adds
+// a member to info.
 type Verification struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Types that are valid to be assigned to Info:
@@ -113,7 +114,7 @@ type Verification_Domain struct {
 
 type Verification_Ans struct {
 	// Agent Name Service verification details.
-	Ans *AnsVerification `protobuf:"bytes,2,opt,name=ans,proto3,oneof"` // Future verification types can be added here.
+	Ans *AnsVerification `protobuf:"bytes,2,opt,name=ans,proto3,oneof"`
 }
 
 func (*Verification_Domain) isVerification_Info() {}
@@ -126,7 +127,8 @@ func (*Verification_Ans) isVerification_Info() {}
 // certificate, attested by the agent's transparency log.
 type AnsVerification struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
-	// The ANS name that was verified (e.g., "ans://v1.0.0.agent.example.com").
+	// The ANS name that was verified, without the record's path
+	// (e.g., "ans://v1.0.0.agent.example.com").
 	AnsName string `protobuf:"bytes,1,opt,name=ans_name,json=ansName,proto3" json:"ans_name,omitempty"`
 	// The agent identifier in the transparency log.
 	AgentId string `protobuf:"bytes,2,opt,name=agent_id,json=agentId,proto3" json:"agent_id,omitempty"`
@@ -236,7 +238,8 @@ type DomainVerification struct {
 	// The identifier of the domain's public key that matched the record's signing key.
 	// This is the "id" field from the well-known file.
 	KeyId string `protobuf:"bytes,3,opt,name=key_id,json=keyId,proto3" json:"key_id,omitempty"`
-	// When the verification was performed.
+	// When the verification was performed. Mirrors Verification.verified_at for
+	// clients that predate it; Verification.verified_at is authoritative.
 	VerifiedAt    *timestamppb.Timestamp `protobuf:"bytes,4,opt,name=verified_at,json=verifiedAt,proto3" json:"verified_at,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache

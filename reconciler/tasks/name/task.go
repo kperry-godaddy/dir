@@ -39,9 +39,20 @@ const (
 	// recorded as failed.
 	pendingBudget = 24 * time.Hour
 
-	// unreadableSignaturesMessage is stored when the record's signatures could
-	// not be pulled. The cause is logged, never stored.
+	// recheckLeadDivisor bounds how far ahead of its TTL a verdict is
+	// re-checked: one task interval, at most this fraction of the TTL.
+	recheckLeadDivisor = 2
+
+	// unreadableSignaturesMessage and unreadablePublicKeysMessage are stored
+	// when part of the record's evidence could not be pulled and the rest did
+	// not verify the name. The cause is logged, never stored.
 	unreadableSignaturesMessage = "could not read the record's signatures"
+	unreadablePublicKeysMessage = "could not read the record's public keys"
+)
+
+var (
+	errUnreadableSignatures = errors.New(unreadableSignaturesMessage)
+	errUnreadablePublicKeys = errors.New(unreadablePublicKeysMessage)
 )
 
 // Task implements the name reconciler task (name ownership verification).
@@ -82,14 +93,15 @@ func (t *Task) IsEnabled() bool {
 }
 
 // Run executes name verification: fetch records needing verification, then
-// verify each. It stops at the first record for which ctx is done; a stop is
-// not a failure of the run.
+// verify each. Records of a host whose lookup failed transiently earlier in
+// the run are deferred to the next run. It stops at the first record for
+// which ctx is done; a stop is not a failure of the run.
 func (t *Task) Run(ctx context.Context) error {
 	started := t.now()
 
 	logger.Debug("Running name verification")
 
-	records, err := t.db.GetRecordsNeedingVerification(t.config.GetTTL())
+	records, err := t.db.GetRecordsNeedingVerification(t.recheckAge())
 	if err != nil {
 		return fmt.Errorf("get records needing name verification: %w", err)
 	}
@@ -103,6 +115,7 @@ func (t *Task) Run(ctx context.Context) error {
 	logger.Info("Processing records for name verification", "count", len(records))
 
 	summary := newRunSummary()
+	unavailable := make(hostSet)
 
 	for i, r := range records {
 		if err := ctx.Err(); err != nil {
@@ -112,7 +125,7 @@ func (t *Task) Run(ctx context.Context) error {
 			return nil
 		}
 
-		summary.add(t.verifyRecord(ctx, r.GetCid(), r.GetName()))
+		summary.add(t.verifyRecord(ctx, r.GetCid(), r.GetName(), unavailable))
 	}
 
 	summary.log(t.now().Sub(started))
@@ -120,9 +133,22 @@ func (t *Task) Run(ctx context.Context) error {
 	return nil
 }
 
+// recheckAge is how old a verdict may be before a run re-checks it: one task
+// interval short of the TTL, at least half the TTL, so a verified record is
+// re-verified before the API stops serving it rather than at that instant.
+func (t *Task) recheckAge() time.Duration {
+	ttl := t.config.GetTTL()
+
+	return ttl - min(t.config.GetInterval(), ttl/recheckLeadDivisor)
+}
+
 // verifyRecord verifies ownership of one record's name within the record
-// timeout and records the result.
-func (t *Task) verifyRecord(ctx context.Context, cid, recordName string) outcome {
+// timeout and records the result. A record whose host failed transiently
+// earlier in this run is deferred to the next run untouched: the same lookup
+// would fail the same way and cost the same time. When part of the record's
+// evidence could not be read, a verdict against the rest is withheld; a
+// verdict for it stands.
+func (t *Task) verifyRecord(ctx context.Context, cid, recordName string, unavailable hostSet) outcome {
 	started := t.now()
 
 	parsed := naming.ParseName(recordName)
@@ -137,51 +163,96 @@ func (t *Task) verifyRecord(ctx context.Context, cid, recordName string) outcome
 		return outcome{kind: outcomeSkipped, protocol: parsed.Protocol}
 	}
 
+	host := parsed.Protocol + parsed.Domain
+	if unavailable.has(host) {
+		logger.Debug("Deferring record to the next run: its host failed earlier in this run", "cid", cid, "recordName", recordName)
+
+		return outcome{kind: outcomeDeferred, method: string(method)}
+	}
+
 	recordCtx, cancel := context.WithTimeout(ctx, t.config.GetRecordTimeout())
 	defer cancel()
 
-	signers, err := t.collectSigners(recordCtx, cid)
-	if err != nil {
-		logger.Warn("Could not read the record's signatures", "cid", cid, "recordName", recordName, "error", err)
+	signers, missing := t.collectSigners(recordCtx, cid, recordName)
 
-		message := unreadableSignaturesMessage
-		if errors.Is(err, errSignaturesCapped) {
-			message = err.Error()
-		}
-
-		result := &naming.Result{Domain: parsed.Domain, Method: string(method), Error: message, Transient: true}
-
-		return t.recordResult(ctx, cid, recordName, result, started)
+	result := t.provider.Verify(recordCtx, recordName, signers)
+	if result.Transient {
+		unavailable.add(host)
 	}
 
-	return t.recordResult(ctx, cid, recordName, t.provider.Verify(recordCtx, recordName, signers), started)
+	if missing != nil && !result.Verified && !result.Transient {
+		logger.Warn("Withholding the verdict: part of the record's evidence could not be read",
+			"cid", cid, "recordName", recordName, "method", result.Method, "verdict", result.Error, "missing", missing.Error())
+
+		result.Error = missing.Error()
+		result.Transient = true
+	}
+
+	return t.recordResult(ctx, cid, recordName, result, started)
+}
+
+// hostSet remembers the hosts (protocol prefix and domain) whose lookup failed
+// transiently during one run.
+type hostSet map[string]struct{}
+
+func (s hostSet) has(host string) bool {
+	_, ok := s[host]
+
+	return ok
+}
+
+func (s hostSet) add(host string) {
+	s[host] = struct{}{}
 }
 
 // collectSigners gathers the parties that signed the record: the certificates
-// bound to its signatures, then the public keys attached to it.
-func (t *Task) collectSigners(ctx context.Context, cid string) ([]naming.Signer, error) {
-	ref := &corev1.RecordRef{Cid: cid}
+// bound to its signatures, then the public keys attached to it. The returned
+// error names evidence that could not be gathered, so the caller can withhold
+// a verdict that would rest on its absence.
+func (t *Task) collectSigners(ctx context.Context, cid, recordName string) ([]naming.Signer, error) {
+	certSigners, missing := t.certificateEvidence(ctx, cid, recordName)
 
-	sigs, err := t.fetcher.PullSignatures(ctx, ref)
+	keySigners, missingKeys := t.publicKeyEvidence(ctx, cid, recordName)
+	if missing == nil {
+		missing = missingKeys
+	}
+
+	return append(certSigners, keySigners...), missing
+}
+
+// certificateEvidence returns the signers bound to the record's signatures.
+func (t *Task) certificateEvidence(ctx context.Context, cid, recordName string) ([]naming.Signer, error) {
+	sigs, err := t.fetcher.PullSignatures(ctx, &corev1.RecordRef{Cid: cid})
 	if err != nil {
-		return nil, fmt.Errorf("pull signatures: %w", err)
+		logger.Warn("Could not read the record's signatures", "cid", cid, "recordName", recordName, "error", err)
+
+		return nil, errUnreadableSignatures
 	}
 
 	signers, capped, err := certificateSigners(ctx, cid, sigs)
 	if err != nil {
-		return nil, err
+		logger.Warn("Could not check the record's signatures", "cid", cid, "recordName", recordName, "error", err)
+
+		return nil, errUnreadableSignatures
 	}
 
-	if capped && len(signers) == 0 {
-		return nil, errSignaturesCapped
+	if capped {
+		return signers, errSignaturesCapped
 	}
 
-	keys, err := t.fetcher.PullPublicKeys(ctx, ref)
+	return signers, nil
+}
+
+// publicKeyEvidence returns the signers given by the record's public keys.
+func (t *Task) publicKeyEvidence(ctx context.Context, cid, recordName string) ([]naming.Signer, error) {
+	keys, err := t.fetcher.PullPublicKeys(ctx, &corev1.RecordRef{Cid: cid})
 	if err != nil {
-		return nil, fmt.Errorf("pull public keys: %w", err)
+		logger.Warn("Could not read the record's public keys", "cid", cid, "recordName", recordName, "error", err)
+
+		return nil, errUnreadablePublicKeys
 	}
 
-	return append(signers, publicKeySigners(cid, keys)...), nil
+	return publicKeySigners(cid, keys), nil
 }
 
 // publicKeySigners decodes the record's public keys, PEM or base64 DER, into
@@ -320,9 +391,10 @@ type step struct {
 
 // transition folds the result of one attempt into the record's row. A verdict
 // replaces the row. A transient failure advances the retry schedule and keeps
-// the verdict columns: a verified row stays verified until its TTL and is
-// pending after it, a failed row stays failed with its own error, and a row
-// pending for pendingBudget becomes failed until its daily retry.
+// the verdict columns: a verified row stays verified while its TTL has not
+// passed and is pending after it, a failed row stays failed with its own
+// error, and a row pending for pendingBudget becomes failed until its daily
+// retry.
 func transition(cid string, existing types.NameVerificationObject, result *naming.Result, now time.Time, p policy) step {
 	switch {
 	case result.Verified:
@@ -355,6 +427,12 @@ func transientStep(cid string, existing types.NameVerificationObject, result *na
 
 	switch existing.GetStatus() {
 	case gormdb.VerificationStatusVerified:
+		if at := existing.GetVerifiedAt(); at != nil && now.Before(at.Add(p.ttl)) {
+			row.Status = gormdb.VerificationStatusVerified
+
+			return step{row: row, kind: outcomeTransient}
+		}
+
 		row.Error = transientErr
 		row.Status = gormdb.VerificationStatusPending
 	case gormdb.VerificationStatusFailed:
@@ -456,6 +534,7 @@ const (
 	outcomeFailed
 	outcomeTransient
 	outcomeSkipped
+	outcomeDeferred
 	outcomeAborted
 	outcomePersistFailed
 )
@@ -469,7 +548,7 @@ type outcome struct {
 
 // runSummary aggregates the outcomes of one run for the completion log line.
 type runSummary struct {
-	verified, failed, transient, skipped, aborted, persistFailed int
+	verified, failed, transient, skipped, deferred, aborted, persistFailed int
 
 	verifiedByMethod  map[string]int
 	failedByMethod    map[string]int
@@ -497,6 +576,8 @@ func (s *runSummary) add(o outcome) {
 	case outcomeSkipped:
 		s.skipped++
 		s.skippedByProtocol[o.protocol]++
+	case outcomeDeferred:
+		s.deferred++
 	case outcomeAborted:
 		s.aborted++
 	case outcomePersistFailed:
@@ -511,6 +592,7 @@ func (s *runSummary) log(duration time.Duration) {
 		"failed", s.failed,
 		"transient", s.transient,
 		"skipped", s.skipped,
+		"deferred", s.deferred,
 		"aborted", s.aborted,
 		"persistFailed", s.persistFailed,
 		"verifiedByMethod", s.verifiedByMethod,

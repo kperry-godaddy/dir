@@ -95,6 +95,7 @@ type fakeDB struct {
 
 	records    []coretypes.Record
 	recordsErr error
+	recheckAge time.Duration
 	existing   *gormdb.NameVerification
 	getErr     error
 
@@ -105,7 +106,9 @@ type fakeDB struct {
 	updated []types.NameVerificationObject
 }
 
-func (f *fakeDB) GetRecordsNeedingVerification(time.Duration) ([]coretypes.Record, error) {
+func (f *fakeDB) GetRecordsNeedingVerification(age time.Duration) ([]coretypes.Record, error) {
+	f.recheckAge = age
+
 	return f.records, f.recordsErr
 }
 
@@ -466,11 +469,12 @@ func TestTask_Run_FetcherErrorIsTransientWithFixedText(t *testing.T) {
 	registryErr := errors.New("registry unavailable: dial tcp 10.0.0.1:5000")
 
 	tests := []struct {
-		name    string
-		fetcher *fakeFetcher
+		name      string
+		fetcher   *fakeFetcher
+		wantError string
 	}{
-		{name: "signatures cannot be pulled", fetcher: &fakeFetcher{sigErr: registryErr}},
-		{name: "public keys cannot be pulled", fetcher: &fakeFetcher{keyErr: registryErr}},
+		{name: "signatures cannot be pulled", fetcher: &fakeFetcher{sigErr: registryErr}, wantError: unreadableSignaturesMessage},
+		{name: "public keys cannot be pulled", fetcher: &fakeFetcher{keyErr: registryErr}, wantError: unreadablePublicKeysMessage},
 	}
 
 	for _, tc := range tests {
@@ -486,7 +490,7 @@ func TestTask_Run_FetcherErrorIsTransientWithFixedText(t *testing.T) {
 			row := db.created[0]
 			assert.Equal(t, gormdb.VerificationStatusPending, row.GetStatus())
 			assert.Equal(t, string(naming.MethodANS), row.GetMethod())
-			assert.Equal(t, "transient: "+unreadableSignaturesMessage, row.GetError())
+			assert.Equal(t, "transient: "+tc.wantError, row.GetError())
 			assert.NotContains(t, row.GetError(), "10.0.0.1")
 			assert.Equal(t, 1, row.GetConsecutiveFailures())
 			assert.Equal(t, at(taskTestInterval/2), row.GetNextAttemptAt())
@@ -666,37 +670,13 @@ func TestTransition(t *testing.T) {
 			wantKind: outcomeTransient,
 		},
 		{
-			name:     "transient on a verified row makes it pending and keeps what it verified",
-			existing: existingRow(gormdb.VerificationStatusVerified, 0),
-			result:   transientResult(dnsTimeoutText),
-			want:     demoted(1, at(taskTestInterval/2)),
-			wantKind: outcomeTransient,
-		},
-		{
-			name:     "transient on a verified row past its ttl makes it pending and keeps what it verified",
+			name:     "transient on a demoted row at the end of its ttl keeps it pending",
 			existing: pendingSinceRow(0, true, 0),
 			result:   transientResult(dnsTimeoutText),
 			want: func() *gormdb.NameVerification {
 				row := demoted(1, at(taskTestInterval/2))
 				expired := fixedNow.Add(-taskTestTTL)
 				row.VerifiedAt = &expired
-
-				return row
-			}(),
-			wantKind: outcomeTransient,
-		},
-		{
-			name: "transient on a verified row without a verification time makes it pending",
-			existing: func() *gormdb.NameVerification {
-				row := existingRow(gormdb.VerificationStatusVerified, 0)
-				row.VerifiedAt = nil
-
-				return row
-			}(),
-			result: transientResult(dnsTimeoutText),
-			want: func() *gormdb.NameVerification {
-				row := demoted(1, at(taskTestInterval/2))
-				row.VerifiedAt = nil
 
 				return row
 			}(),
@@ -720,18 +700,6 @@ func TestTransition(t *testing.T) {
 				RecordCID: taskTestCID, Method: string(naming.MethodANS), Status: gormdb.VerificationStatusPending,
 				Error: "transient: transport down", ConsecutiveFailures: 3, NextAttemptAt: at(10 * time.Minute),
 			},
-			wantKind: outcomeTransient,
-		},
-		{
-			name:     "retry-after on a verified row makes it pending without a strike",
-			existing: existingRow(gormdb.VerificationStatusVerified, 0),
-			result:   retryAfter,
-			want: func() *gormdb.NameVerification {
-				row := demoted(0, at(10*time.Minute))
-				row.Error = "transient: transport down"
-
-				return row
-			}(),
 			wantKind: outcomeTransient,
 		},
 		{
@@ -828,6 +796,80 @@ func TestTransition(t *testing.T) {
 	}
 }
 
+// A transient failure keeps a verified row verified while its TTL has not
+// passed and demotes it to pending afterwards, keeping what it verified.
+func TestTransition_VerifiedRows(t *testing.T) {
+	p := policy{ttl: taskTestTTL, interval: taskTestInterval}
+	retryAfter := retryAfterResult(errLookupDown.Error(), fixedNow.Add(10*time.Minute))
+
+	demoted := func(failures int, next *time.Time, verifiedAt *time.Time) *gormdb.NameVerification {
+		return &gormdb.NameVerification{
+			RecordCID: taskTestCID, Method: string(naming.MethodANS), Status: gormdb.VerificationStatusPending,
+			Error: "transient: ans dns: lookup timed out", ConsecutiveFailures: failures, NextAttemptAt: next,
+			KeyID: victimKeyID, Details: taskTestDetails, VerifiedAt: verifiedAt,
+		}
+	}
+	kept := func(failures int, next *time.Time) *gormdb.NameVerification {
+		return &gormdb.NameVerification{
+			RecordCID: taskTestCID, Method: string(naming.MethodANS), KeyID: victimKeyID,
+			Status: gormdb.VerificationStatusVerified, Details: taskTestDetails, VerifiedAt: &existingVerifiedAt,
+			ConsecutiveFailures: failures, NextAttemptAt: next,
+		}
+	}
+	verifiedAt := func(offset time.Duration) *gormdb.NameVerification {
+		row := existingRow(gormdb.VerificationStatusVerified, 0)
+		row.VerifiedAt = at(offset)
+
+		return row
+	}
+
+	tests := []struct {
+		name     string
+		existing *gormdb.NameVerification
+		result   *naming.Result
+		want     *gormdb.NameVerification
+	}{
+		{
+			name:     "transient within the ttl keeps it verified and schedules a retry",
+			existing: existingRow(gormdb.VerificationStatusVerified, 0),
+			result:   transientResult(dnsTimeoutText),
+			want:     kept(1, at(taskTestInterval/2)),
+		},
+		{
+			name:     "retry-after within the ttl keeps it verified and sets the schedule",
+			existing: existingRow(gormdb.VerificationStatusVerified, 0),
+			result:   retryAfter,
+			want:     kept(0, at(10*time.Minute)),
+		},
+		{
+			name:     "transient past the ttl makes it pending and keeps what it verified",
+			existing: verifiedAt(-taskTestTTL - time.Hour),
+			result:   transientResult(dnsTimeoutText),
+			want:     demoted(1, at(taskTestInterval/2), at(-taskTestTTL-time.Hour)),
+		},
+		{
+			name: "transient without a verification time makes it pending",
+			existing: func() *gormdb.NameVerification {
+				row := existingRow(gormdb.VerificationStatusVerified, 0)
+				row.VerifiedAt = nil
+
+				return row
+			}(),
+			result: transientResult(dnsTimeoutText),
+			want:   demoted(1, at(taskTestInterval/2), nil),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := transition(taskTestCID, tc.existing, tc.result, fixedNow, p)
+
+			assert.Equal(t, outcomeTransient, got.kind)
+			assert.Equal(t, tc.want, got.row)
+		})
+	}
+}
+
 // Run loads the row once, calls Verify once and writes the transition once:
 // a create when there is no row, an update otherwise.
 func TestTask_Run_WritesTheTransitionOnce(t *testing.T) {
@@ -841,7 +883,7 @@ func TestTask_Run_WritesTheTransitionOnce(t *testing.T) {
 		wantStatus string
 	}{
 		{name: "transient with no row is created pending", lookupErr: errDNSTimeout, wantCreate: true, wantStatus: gormdb.VerificationStatusPending},
-		{name: "transient on a verified row is updated in place as pending", existing: existingRow(gormdb.VerificationStatusVerified, 0), lookupErr: errDNSTimeout, wantStatus: gormdb.VerificationStatusPending},
+		{name: "transient on a verified row within its ttl is updated in place and stays verified", existing: existingRow(gormdb.VerificationStatusVerified, 0), lookupErr: errDNSTimeout, wantStatus: gormdb.VerificationStatusVerified},
 		{name: "verified result on a pending row is updated", existing: existingRow(gormdb.VerificationStatusPending, 5), wantStatus: gormdb.VerificationStatusVerified},
 		{name: "terminal result with no row is created failed", lookupErr: errAgentRevoke, wantCreate: true, wantStatus: gormdb.VerificationStatusFailed},
 	}
@@ -895,7 +937,7 @@ func TestTask_VerifyRecord_PersistFailures(t *testing.T) {
 
 			task := newTestTask(t, Config{Enabled: true}, tc.db, fetcher, ansProvider(lookup))
 
-			got := task.verifyRecord(t.Context(), taskTestCID, taskTestANSName)
+			got := task.verifyRecord(t.Context(), taskTestCID, taskTestANSName, hostSet{})
 
 			assert.Equal(t, outcomePersistFailed, got.kind)
 			assert.Equal(t, string(naming.MethodANS), got.method)
@@ -959,7 +1001,7 @@ func TestTask_VerifyRecord_CancellationWhileCollectingSignersWritesNothing(t *te
 
 	task := newTestTask(t, Config{Enabled: true}, db, &fakeFetcher{signatures: []*signv1.Signature{signedBy(t, victim)}}, ansProvider(lookup))
 
-	got := task.verifyRecord(ctx, taskTestCID, taskTestANSName)
+	got := task.verifyRecord(ctx, taskTestCID, taskTestANSName, hostSet{})
 
 	assert.Equal(t, outcomeAborted, got.kind)
 	assert.Equal(t, 0, db.writes())
@@ -977,7 +1019,7 @@ func TestTask_VerifyRecord_SuccessAfterCancellationIsStored(t *testing.T) {
 
 	task := newTestTask(t, Config{Enabled: true}, db, &fakeFetcher{signatures: []*signv1.Signature{signedBy(t, victim)}}, ansProvider(lookup))
 
-	got := task.verifyRecord(ctx, taskTestCID, taskTestANSName)
+	got := task.verifyRecord(ctx, taskTestCID, taskTestANSName, hostSet{})
 
 	assert.Equal(t, outcomeVerified, got.kind)
 	require.Len(t, db.created, 1)
@@ -993,6 +1035,7 @@ func TestRunSummary(t *testing.T) {
 	summary.add(outcome{kind: outcomeTransient, method: "ans"})
 	summary.add(outcome{kind: outcomeSkipped, protocol: ansProtocol})
 	summary.add(outcome{kind: outcomeSkipped, protocol: ansProtocol})
+	summary.add(outcome{kind: outcomeDeferred, method: "ans"})
 	summary.add(outcome{kind: outcomeAborted, method: "ans"})
 	summary.add(outcome{kind: outcomePersistFailed, method: "ans"})
 
@@ -1000,6 +1043,7 @@ func TestRunSummary(t *testing.T) {
 	assert.Equal(t, 1, summary.failed)
 	assert.Equal(t, 1, summary.transient)
 	assert.Equal(t, 2, summary.skipped)
+	assert.Equal(t, 1, summary.deferred)
 	assert.Equal(t, 1, summary.aborted)
 	assert.Equal(t, 1, summary.persistFailed)
 	assert.Equal(t, map[string]int{"ans": 1, "wellknown": 1}, summary.verifiedByMethod)
@@ -1051,4 +1095,146 @@ func TestTask_VerifyRecord_SignatureFloodWithoutBoundCertificateIsPending(t *tes
 	assert.Equal(t, gormdb.VerificationStatusPending, db.created[0].GetStatus())
 	assert.Equal(t, "transient: "+errSignaturesCapped.Error(), db.created[0].GetError())
 	assert.Equal(t, 0, lookup.calls)
+}
+
+// Bound decoy certificates ahead of the real signature fill the examined
+// window; the verdict against them is withheld rather than recorded.
+func TestTask_VerifyRecord_SignatureFloodOfBoundDecoysIsPending(t *testing.T) {
+	victim := newTestIdentity(t, signersTestSAN)
+
+	sigs := make([]*signv1.Signature, 0, maxSignaturesExamined+1)
+	for range maxSignaturesExamined {
+		sigs = append(sigs, signedBy(t, newTestIdentity(t, signersTestSAN)))
+	}
+
+	sigs = append(sigs, signedBy(t, victim))
+
+	lookup := &fakeLookup{err: errors.New("ans certificate: no attached certificate is attested for this agent")}
+	db := &fakeDB{}
+
+	task := newTestTask(t, Config{Enabled: true, Interval: taskTestInterval}, db, &fakeFetcher{signatures: sigs}, ansProvider(lookup))
+
+	got := task.verifyRecord(t.Context(), taskTestCID, taskTestANSName, hostSet{})
+
+	assert.Equal(t, outcomeTransient, got.kind)
+	require.Len(t, db.created, 1)
+	assert.Equal(t, gormdb.VerificationStatusPending, db.created[0].GetStatus())
+	assert.Equal(t, "transient: "+errSignaturesCapped.Error(), db.created[0].GetError())
+	assert.Equal(t, 1, lookup.calls)
+	assert.Len(t, lookup.evidence.Certificates, maxSignaturesExamined)
+}
+
+// A verdict for the examined signers stands under a flood: the cap withholds
+// only a verdict against them.
+func TestTask_VerifyRecord_FloodDoesNotWithholdAVerifiedVerdict(t *testing.T) {
+	victim := newTestIdentity(t, signersTestSAN)
+	sigs := append([]*signv1.Signature{signedBy(t, victim)}, junkSignatures(t, victim, maxSignaturesExamined)...)
+	lookup := &fakeLookup{keys: []naming.PublicKey{publishedKey(t, victim)}, details: json.RawMessage(taskTestDetails)}
+	db := &fakeDB{}
+
+	task := newTestTask(t, Config{Enabled: true}, db, &fakeFetcher{signatures: sigs}, ansProvider(lookup))
+
+	got := task.verifyRecord(t.Context(), taskTestCID, taskTestANSName, hostSet{})
+
+	assert.Equal(t, outcomeVerified, got.kind)
+	require.Len(t, db.created, 1)
+	assert.Equal(t, gormdb.VerificationStatusVerified, db.created[0].GetStatus())
+}
+
+// The JWKS lane never needed the record's signatures: a flood of them or a
+// failure to read them does not withhold a verdict its public keys reach.
+func TestTask_Run_HTTPSVerdictStandsWhenSignaturesAreIncomplete(t *testing.T) {
+	victim := newTestIdentity(t, signersTestSAN)
+
+	pemKey, err := cryptoutils.MarshalPublicKeyToPEM(victim.key.Public())
+	require.NoError(t, err)
+
+	tests := []struct {
+		name    string
+		fetcher *fakeFetcher
+	}{
+		{name: "signatures cannot be pulled", fetcher: &fakeFetcher{sigErr: errors.New("registry unavailable"), publicKeys: []string{string(pemKey)}}},
+		{name: "signature flood", fetcher: &fakeFetcher{signatures: junkSignatures(t, victim, maxSignaturesExamined+1), publicKeys: []string{string(pemKey)}}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			wellKnown := &fakeKeyLookup{keys: []naming.PublicKey{publishedKey(t, victim)}}
+			db := &fakeDB{records: []coretypes.Record{&fakeRecord{cid: taskTestCID, name: taskTestHTTPS}}}
+
+			task := newTestTask(t, Config{Enabled: true}, db, tc.fetcher, naming.NewProvider(naming.WithWellKnownLookup(wellKnown)))
+			require.NoError(t, task.Run(t.Context()))
+
+			require.Len(t, db.created, 1)
+			assert.Equal(t, gormdb.VerificationStatusVerified, db.created[0].GetStatus())
+			assert.Equal(t, victimKeyID, db.created[0].GetKeyID())
+		})
+	}
+}
+
+// A host whose lookup failed transiently is not looked up again in the same
+// run: its other records are deferred to the next run without a row change.
+func TestTask_Run_DefersRecordsOfAHostThatFailedTransiently(t *testing.T) {
+	victim := newTestIdentity(t, signersTestSAN)
+	lookup := &fakeLookup{err: errDNSTimeout}
+	fetcher := &fakeFetcher{signatures: []*signv1.Signature{signedBy(t, victim)}}
+	db := &fakeDB{records: []coretypes.Record{
+		&fakeRecord{cid: taskTestCID, name: taskTestANSName},
+		&fakeRecord{cid: taskTestOtherCID, name: "ans://v2.0.0.agent.example.com"},
+	}}
+
+	task := newTestTask(t, Config{Enabled: true, Interval: taskTestInterval}, db, fetcher, ansProvider(lookup))
+	require.NoError(t, task.Run(t.Context()))
+
+	require.Len(t, db.created, 1, "only the first record of the host is written")
+	assert.Equal(t, gormdb.VerificationStatusPending, db.created[0].GetStatus())
+	assert.Equal(t, 1, lookup.calls)
+	assert.Equal(t, 1, fetcher.sigCalls, "the deferred record's signatures are not pulled")
+}
+
+// A terminal failure says nothing about the host, so its other records are
+// still attempted.
+func TestTask_Run_TerminalFailureDoesNotDeferTheHost(t *testing.T) {
+	victim := newTestIdentity(t, signersTestSAN)
+	lookup := &fakeLookup{err: errAgentRevoke}
+	fetcher := &fakeFetcher{signatures: []*signv1.Signature{signedBy(t, victim)}}
+	db := &fakeDB{records: []coretypes.Record{
+		&fakeRecord{cid: taskTestCID, name: taskTestANSName},
+		&fakeRecord{cid: taskTestOtherCID, name: taskTestANSName},
+	}}
+
+	task := newTestTask(t, Config{Enabled: true, Interval: taskTestInterval}, db, fetcher, ansProvider(lookup))
+	require.NoError(t, task.Run(t.Context()))
+
+	assert.Equal(t, 2, fetcher.sigCalls, "both records are attempted")
+	require.Len(t, db.created, 2)
+	assert.Equal(t, gormdb.VerificationStatusFailed, db.created[0].GetStatus())
+}
+
+func TestRecheckAge(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  Config
+		want time.Duration
+	}{
+		{name: "one interval before the ttl", cfg: Config{TTL: taskTestTTL, Interval: taskTestInterval}, want: taskTestTTL - taskTestInterval},
+		{name: "at most half the ttl ahead", cfg: Config{TTL: time.Hour, Interval: time.Hour}, want: 30 * time.Minute},
+		{name: "defaults", cfg: Config{}, want: (&Config{}).GetTTL() - DefaultInterval},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			task := newTestTask(t, tc.cfg, &fakeDB{}, &fakeFetcher{}, ansProvider(&fakeLookup{}))
+
+			assert.Equal(t, tc.want, task.recheckAge())
+		})
+	}
+}
+
+func TestTask_Run_SelectsVerdictsOlderThanTheRecheckAge(t *testing.T) {
+	db := &fakeDB{}
+	task := newTestTask(t, Config{Enabled: true, TTL: taskTestTTL, Interval: taskTestInterval}, db, &fakeFetcher{}, ansProvider(&fakeLookup{}))
+
+	require.NoError(t, task.Run(t.Context()))
+	assert.Equal(t, taskTestTTL-taskTestInterval, db.recheckAge)
 }

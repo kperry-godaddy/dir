@@ -440,3 +440,14 @@ func TestCertificateSignersReportsTheCap(t *testing.T) {
 		})
 	}
 }
+
+func TestRejectedCertificatesCount(t *testing.T) {
+	var rejected rejectedCertificates
+
+	for _, why := range []certificateRejection{rejectionNone, rejectionOversized, rejectionMalformed, rejectionMalformed, rejectionUnsupportedKey, rejectionUnbound} {
+		rejected.count(why)
+	}
+
+	assert.Equal(t, rejectedCertificates{oversized: 1, malformed: 2, unsupportedKey: 1, unbound: 1}, rejected)
+	assert.Equal(t, 5, rejected.total())
+}

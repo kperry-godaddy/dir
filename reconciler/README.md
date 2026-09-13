@@ -41,12 +41,14 @@ The name task verifies ownership of named records and caches results. The protoc
 
 It:
 
-1. Queries the database for signed records with verifiable names that have no verification, an expired one (per `name.ttl`), or a scheduled retry that is due
-2. For each record, collects the signers: the certificates bound to the record's signatures (a certificate counts only when its key produced the signature over the record CID) and the public keys attached to the record
+1. Queries the database for signed records with verifiable names that have no verification, a verdict older than `name.ttl` minus one `name.interval` (so a verified record is re-verified before the API stops serving it), or a scheduled retry that is due
+2. For each record, collects the signers: the certificates bound to the record's signatures (a certificate counts only when its key produced the signature over the record CID) and the public keys attached to the record. When part of this evidence cannot be read, a verdict against the rest is withheld and the record is `pending`; a verdict for it stands
 3. Runs the verification method selected by the name's protocol once per record
 4. Stores the result (`verified`, `failed`, or `pending`) in the database for efficient API filtering
 
-Records whose protocol has no method configured (for example `ans://` names while `name.ans.enabled` is false) are skipped without writing a row and counted as `skipped` in the run summary, so enabling the method takes effect on the next run rather than after the TTL. Rows the method verified before it was disabled are not rewritten until it is enabled again: the API serves them until their TTL, while `dirctl search --verified` lists them until the row changes or is deleted with the statement under Operator steps.
+Records whose name parses but whose protocol has no method configured (for example `ans://` names while `name.ans.enabled` is false) are skipped without writing a row and counted as `skipped` in the run summary, so enabling the method takes effect on the next run rather than after the TTL. A name that does not parse at all is a `failed` row with method `none`. Rows the method verified before it was disabled are not rewritten until it is enabled again: the API serves them until their TTL, while `dirctl search --verified` lists them until the row changes or is deleted with the statement under Operator steps.
+
+Records that share a host (protocol prefix and domain) with one whose lookup failed transiently earlier in the same run are deferred to the next run without a row change and counted as `deferred`, so an unreachable host costs one lookup per run.
 
 `name.record_timeout` bounds one record's attempt, including pulling its signatures and public keys from the store.
 
@@ -64,14 +66,16 @@ Records whose protocol has no method configured (for example `ans://` names whil
 
 Slow DNS eats into the same `name.ans.timeout` budget as the log fetches; raise it if lookups time out on a healthy log.
 
+The reconciler needs outbound DNS for the `_ans-badge` lookups and HTTPS (port 443, or the port given in `name.ans.trusted_log_hosts`) to the trusted logs. An invalid `name.ans.*` configuration, including a `ca_file` that cannot be read, stops the reconciler at startup and with it every other task; the log line `Reconciler failed` names the cause. `ca_file` is read once at startup, so restart the reconciler after replacing the file.
+
 #### Result states and retries
 
-- `verified` and `failed` are verdicts. A verified row is served until `name.ttl` after the time it verified and is re-checked only then, so nothing changes it before its TTL; a failed row is re-checked after `name.ttl`. A revoked agent, a name that does not match the attested one, a missing or unattested certificate and an expired certificate are all `failed`.
+- `verified` and `failed` are verdicts. A verified row is served until `name.ttl` after the time it verified. It is re-checked one `name.interval` before that (at least half the TTL after verifying); a transient failure at a re-check within the TTL leaves it `verified` and schedules a retry. A failed row is re-checked after `name.ttl`. A revoked agent, a name that does not match the attested one, a missing or unattested certificate and an expired certificate are all `failed`.
 - `pending` means the last attempt failed transiently (DNS or the transparency log unreachable, a log answering anything but a verdict, or the record's signatures could not be read) and no verdict is served. The first retry lands on the next run; each further transient failure doubles the delay, up to 24 hours. A method that reports its dependency as down sets the retry time directly without counting a strike.
-- When the re-check at the end of a verified record's TTL fails transiently, the record becomes `pending` and keeps the certificate fingerprint, details and verification time it last verified with until a verdict replaces them. A verified record is never demoted by a count of failures.
+- When a verified record's re-check fails transiently after its TTL has passed, the record becomes `pending` and keeps the certificate fingerprint, details and verification time it last verified with until a verdict replaces them. A verified record is never demoted by a count of failures.
 - A failed record whose re-check fails transiently keeps `failed` and its own error, and follows the retry schedule.
 - A record that has been `pending` for 24 hours (since its creation, or since the end of its TTL for a record demoted from `verified`) becomes `failed` with `verification unavailable for 24h; last: …`; later attempts follow the retry schedule, at most one a day.
-- The stored error of a `pending` row starts with `transient: `. A record whose signatures could not be read stores `could not read the record's signatures`; the store error is in the reconciler log. A record carrying more signatures than the task examines (256) with none of the examined ones bound to an attached certificate is `pending` with a message saying so.
+- The stored error of a `pending` row starts with `transient: `. A record whose signatures or public keys could not be read stores `could not read the record's signatures` or `could not read the record's public keys` unless the evidence that was read verifies the name; the store error is in the reconciler log. A record carrying more signatures than the task examines (256) whose examined signers did not verify the name is `pending` with a message saying so.
 
 `dirctl naming verify` reports the stored error for `pending` and `failed` rows.
 
@@ -85,9 +89,13 @@ dirctl naming verify <cid> --output json
 
 Then read the reconciler log:
 
-- `Name verification did not verify`: one line per attempt that did not verify, with `cid`, `recordName`, `method`, `error` (the stored text), `transient`, `status` and, when a retry was scheduled, `consecutiveFailures` and `nextAttemptAt`.
-- `Name verification complete`: one line per run with the `verified`, `failed`, `transient`, `skipped`, `aborted` and `persistFailed` counts and `durationMs`.
-- `Could not read the record's signatures`: the store error behind a `could not read the record's signatures` row.
+- `Name verification did not verify`: one line per attempt that did not verify, with `cid`, `recordName`, `method`, `error` (the stored text), `cause` (the text of this attempt's failure, which differs from `error` when a `failed` row keeps its verdict), `transient`, `status` and, when a retry was scheduled, `consecutiveFailures` and `nextAttemptAt`.
+- `Name verification complete`: one line per run with the `verified`, `failed`, `transient`, `skipped`, `deferred`, `aborted` and `persistFailed` counts and `durationMs`.
+- `Could not read the record's signatures` and `Could not read the record's public keys`: the store error behind a row that stores the matching text.
+- `Withholding the verdict`: the verdict the examined evidence produced and what could not be read.
+- `Rejected attached certificates`: how many certificates attached to the record's signatures were set aside and why (`unbound` means the certificate's key did not produce the signature, the copied-certificate case).
+- `No attached certificate names this agent within its validity period`: the bound certificates were set aside by the ANS method, counted by reason.
+- `Badge lookup failed`: the resolver's error behind an `ans dns:` row.
 - `Transparency log circuit opened`: a trusted log failed repeatedly; records that depend on it are rescheduled until the circuit closes.
 - `Transparency log fetch failed`: the cause of one failed fetch from a log.
 
@@ -98,18 +106,20 @@ Stored errors of the ANS method start with the stage that failed:
 | `ans name:` | The name's version is not a valid ANS version |
 | `ans dns:` | No `_ans-badge` record for the agent host (the SDK also accepts a legacy `_ra-badge` record), or the lookup timed out |
 | `ans log:` | The log's circuit is open after consecutive connection failures; the row waits for the cooldown |
-| `ans root-keys:` | The log's root keys could not be fetched or parsed (unpinned mode), or a signature names a key id the pinned set does not know |
+| `ans root-keys:` | The log's root keys could not be fetched or parsed (unpinned mode) |
 | `ans badge-url:` | The badge points at a log that is not in `name.ans.trusted_log_hosts` |
-| `ans status-token:` | The log did not confirm the agent as active; `HTTP 410` means the agent is revoked or otherwise terminal; any other HTTP status is transient and leaves the row `pending` |
-| `ans receipt:` | The agent's receipt could not be fetched or did not verify; `HTTP 503` means the event is not yet checkpointed, which is transient and leaves the row `pending` |
+| `ans status-token:` | The log did not confirm the agent as connectable (`ACTIVE`, `WARNING` or `DEPRECATED`). `HTTP 410` means the agent is revoked or otherwise terminal and `HTTP 501` that the log does not serve the route; both are `failed`. Any other HTTP status is transient and leaves the row `pending`. `signed by unknown key id` means the log signed with a key that `name.ans.root_keys` does not contain; it is transient, so update the pinned keys |
+| `ans receipt:` | The agent's receipt could not be fetched or did not verify; `HTTP 503` or `HTTP 404` means the event is not yet checkpointed, which is transient and leaves the row `pending`; `signed by unknown key id` is the same stale-pinned-keys case as above |
 | `ans certificate:` | The attached certificate is not the one attested for the agent, or it is expired or not yet valid |
 
 #### Operator steps
 
+Enable the method in two steps when `ca_file` points at a mounted Secret: create the Secret, then set `name.ans.*`. Disabling the method (`name.ans.enabled: false`) does not touch stored rows.
+
 Rollback after removing the ANS method, so rows it verified do not stay verified until the TTL:
 
 ```sql
-UPDATE name_verifications SET status='failed', error='ans method removed', verified_at=NULL WHERE method='ans';
+UPDATE name_verifications SET status='failed', error='ans method removed', verified_at=NULL, next_attempt_at=NULL, consecutive_failures=0 WHERE method='ans';
 ```
 
 Force re-verification of ANS rows on the next run after fixing a bad configuration; the rows are recreated without their retry schedule:
@@ -118,7 +128,13 @@ Force re-verification of ANS rows on the next run after fixing a bad configurati
 DELETE FROM name_verifications WHERE method='ans' AND status IN ('failed','pending');
 ```
 
-When a release changes the stored `ans` details schema, upgrade the API server before the reconciler: the API server reads rows written by any earlier schema version but rejects newer ones.
+A revoked agent is noticed at the row's next re-check, up to `name.ttl` later. To re-check verified ANS rows on the next run instead:
+
+```sql
+UPDATE name_verifications SET next_attempt_at=CURRENT_TIMESTAMP WHERE method='ans' AND status='verified';
+```
+
+Upgrade the API server and the reconciler together (the Helm chart does). An earlier reconciler does not write `verified_at`, so a row it verifies after the API server upgrade reads as unverified until the upgraded reconciler's next run. When a later release changes the stored `ans` details schema, upgrade the API server first: it reads rows written by any earlier schema version but rejects newer ones.
 
 ### Signature Task
 

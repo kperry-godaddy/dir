@@ -7,8 +7,11 @@ package wellknown
 
 import (
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"time"
 
@@ -140,8 +143,8 @@ func (f *Fetcher) LookupKeysWithScheme(ctx context.Context, domain, scheme strin
 }
 
 // fetch downloads the well-known file. Failures before the server answered,
-// a 5xx and a 429 are transient; any other status and an oversized body are
-// facts about the domain and terminal.
+// a 5xx and a 429 are transient; a host that does not exist, any other status
+// and an oversized body are facts about the domain and terminal.
 func (f *Fetcher) fetch(ctx context.Context, url string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -150,7 +153,9 @@ func (f *Fetcher) fetch(ctx context.Context, url string) ([]byte, error) {
 
 	resp, err := f.client.Do(req)
 	if err != nil {
-		return nil, naming.Transient(fmt.Errorf("failed to fetch JWKS from %s: %w", url, err))
+		logger.Warn("JWKS fetch failed", "url", url, "error", err)
+
+		return nil, fetchFailure(url, err)
 	}
 
 	defer resp.Body.Close()
@@ -167,7 +172,9 @@ func (f *Fetcher) fetch(ctx context.Context, url string) ([]byte, error) {
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxJWKSBytes+1))
 	if err != nil {
-		return nil, naming.Transient(fmt.Errorf("failed to read JWKS from %s: %w", url, err))
+		logger.Warn("JWKS body could not be read", "url", url, "error", err)
+
+		return nil, naming.Transient(fmt.Errorf("failed to read JWKS from %s", url))
 	}
 
 	if len(body) > maxJWKSBytes {
@@ -175,4 +182,30 @@ func (f *Fetcher) fetch(ctx context.Context, url string) ([]byte, error) {
 	}
 
 	return body, nil
+}
+
+// fetchFailure describes a request that got no HTTP response. The transport's
+// own text names resolver and peer addresses, and the description is stored
+// and served with the verdict, so only the kind of failure is kept; the cause
+// is in the log. A host that does not exist is a fact about the domain; the
+// other kinds may change on retry.
+func fetchFailure(url string, err error) error {
+	if dnsErr, ok := errors.AsType[*net.DNSError](err); ok && dnsErr.IsNotFound {
+		return fmt.Errorf("failed to fetch JWKS from %s: host not found", url)
+	}
+
+	return naming.Transient(fmt.Errorf("failed to fetch JWKS from %s: %s", url, failureKind(err)))
+}
+
+// failureKind names the kind of transport failure without its details.
+func failureKind(err error) string {
+	if netErr, ok := errors.AsType[net.Error](err); errors.Is(err, context.DeadlineExceeded) || (ok && netErr.Timeout()) {
+		return "request timed out"
+	}
+
+	if _, ok := errors.AsType[*tls.CertificateVerificationError](err); ok {
+		return "TLS certificate not trusted"
+	}
+
+	return "connection failed"
 }

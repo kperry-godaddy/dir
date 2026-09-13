@@ -273,13 +273,20 @@ func (v *Verifier) filterCertificates(want agentName, evidence naming.Evidence) 
 	}
 
 	if filter.skipped() > 0 {
-		logger.Warn("Skipped attached certificates",
+		attrs := []any{
 			"ansName", want.String(),
 			"kept", len(kept),
 			"oversized", filter.oversized,
 			"unparsable", filter.unparsable,
 			"otherAgent", filter.otherAgent,
-			"outsideValidity", filter.outsideValidity)
+			"outsideValidity", filter.outsideValidity,
+		}
+
+		if len(kept) == 0 {
+			logger.Warn("No attached certificate names this agent within its validity period", attrs...)
+		} else {
+			logger.Debug("Skipped attached certificates", attrs...)
+		}
 	}
 
 	if len(kept) == 0 {
@@ -367,7 +374,7 @@ func (v *Verifier) resolveTarget(ctx context.Context, want agentName) (badgeTarg
 			return badgeTarget{}, fail(stageDNS, fmt.Sprintf("no _ans-badge record for %s version %s", want.host, want.version))
 		}
 
-		logger.Debug("Badge lookup failed", "fqdn", fqdn.String(), "error", err)
+		logger.Warn("Badge lookup failed", "ansName", want.String(), "fqdn", fqdn.String(), "error", err)
 
 		return badgeTarget{}, failWith(stageDNS, err, describe(err))
 	}

@@ -106,7 +106,8 @@ func (n *namingCtrl) GetVerificationInfo(ctx context.Context, req *namingv1.GetV
 	}
 
 	// Check if the latest verification is valid (verified and not expired)
-	if !n.isVerificationValid(latest) {
+	verifiedAt, ok := n.validVerifiedAt(latest)
+	if !ok {
 		errMsg := latest.GetError()
 		if errMsg == "" {
 			errMsg = "verification invalid or expired"
@@ -121,7 +122,7 @@ func (n *namingCtrl) GetVerificationInfo(ctx context.Context, req *namingv1.GetV
 	// Return valid verification from database
 	namingLogger.Debug("Returning verification from database", "cid", cid)
 
-	verification, err := n.buildVerification(ctx, cid, latest)
+	verification, err := n.buildVerification(ctx, cid, latest, verifiedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -135,8 +136,8 @@ func (n *namingCtrl) GetVerificationInfo(ctx context.Context, req *namingv1.GetV
 // buildVerification maps a verified row to the wire shape of its method. The
 // verification time is reported on the envelope for every method; the domain
 // arm repeats it for clients that predate the envelope field.
-func (n *namingCtrl) buildVerification(ctx context.Context, cid string, latest types.NameVerificationObject) (*namingv1.Verification, error) {
-	verifiedAt := timestamppb.New(*latest.GetVerifiedAt())
+func (n *namingCtrl) buildVerification(ctx context.Context, cid string, latest types.NameVerificationObject, at time.Time) (*namingv1.Verification, error) {
+	verifiedAt := timestamppb.New(at)
 
 	var verification *namingv1.Verification
 
@@ -187,14 +188,15 @@ func buildAnsVerification(cid string, latest types.NameVerificationObject) (*nam
 	}, nil
 }
 
-// isVerificationValid reports whether the row is a verified verdict whose
-// verified_at is within the TTL.
-func (n *namingCtrl) isVerificationValid(v types.NameVerificationObject) bool {
-	if v.GetStatus() != gormdb.VerificationStatusVerified || v.GetVerifiedAt() == nil {
-		return false
+// validVerifiedAt returns when the row verified, when it is a verified verdict
+// whose verified_at is within the TTL.
+func (n *namingCtrl) validVerifiedAt(v types.NameVerificationObject) (time.Time, bool) {
+	at := v.GetVerifiedAt()
+	if v.GetStatus() != gormdb.VerificationStatusVerified || at == nil {
+		return time.Time{}, false
 	}
 
-	return time.Now().Before(v.GetVerifiedAt().Add(n.ttl))
+	return *at, time.Now().Before(at.Add(n.ttl))
 }
 
 // getDomainFromRecord extracts the domain from a record's name.

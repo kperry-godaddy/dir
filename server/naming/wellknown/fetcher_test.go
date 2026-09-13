@@ -4,13 +4,18 @@
 package wellknown
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -147,5 +152,70 @@ func TestLookupKeysWithSchemeUnreachableHostIsTransient(t *testing.T) {
 
 	if !errors.Is(err, naming.ErrTransient) {
 		t.Errorf("connection failure is not transient: %v", err)
+	}
+
+	if !strings.Contains(err.Error(), "connection failed") || strings.Contains(err.Error(), "dial tcp") {
+		t.Errorf("error = %q, want the kind of failure without the transport's text", err)
+	}
+}
+
+func TestFetchFailure(t *testing.T) {
+	const jwksURL = "https://example.com/.well-known/jwks.json"
+
+	tests := []struct {
+		name          string
+		err           error
+		want          string
+		wantTransient bool
+	}{
+		{
+			name: "unknown host is terminal",
+			err:  &net.DNSError{Err: "no such host", Name: "example.com", IsNotFound: true},
+			want: "host not found",
+		},
+		{
+			name:          "other dns failure is transient",
+			err:           &net.DNSError{Err: "server misbehaving", Name: "example.com", IsTemporary: true},
+			want:          "connection failed",
+			wantTransient: true,
+		},
+		{
+			name:          "deadline is transient",
+			err:           context.DeadlineExceeded,
+			want:          "request timed out",
+			wantTransient: true,
+		},
+		{
+			name:          "network timeout is transient",
+			err:           &net.DNSError{Err: "i/o timeout", Name: "example.com", IsTimeout: true},
+			want:          "request timed out",
+			wantTransient: true,
+		},
+		{
+			name:          "untrusted certificate is transient",
+			err:           &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}},
+			want:          "TLS certificate not trusted",
+			wantTransient: true,
+		},
+		{
+			name:          "refused connection is transient",
+			err:           errors.New("dial tcp 10.0.0.1:443: connect: connection refused"),
+			want:          "connection failed",
+			wantTransient: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := fetchFailure(jwksURL, &url.Error{Op: "Get", URL: jwksURL, Err: tt.err})
+
+			if !strings.Contains(err.Error(), tt.want) || strings.Contains(err.Error(), "10.0.0.1") {
+				t.Fatalf("fetchFailure() = %q, want containing %q and no transport text", err, tt.want)
+			}
+
+			if errors.Is(err, naming.ErrTransient) != tt.wantTransient {
+				t.Errorf("transient = %v, want %v", !tt.wantTransient, tt.wantTransient)
+			}
+		})
 	}
 }

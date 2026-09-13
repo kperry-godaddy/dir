@@ -122,18 +122,24 @@ func runCommand(cmd *cobra.Command, recordCID string) error {
 }
 
 // Sign signs the record with the flag-bound signing options and returns the
-// stored signature. Warnings a user should see before signing, such as an
-// attached certificate outside its validity period, go to stderr. "dirctl
-// push --sign" and "dirctl import --sign" call it and report the certificate
-// with PrintCertificate.
+// stored signature. Warnings a user should see, such as a signing error's
+// guidance, go to stderr. "dirctl push --sign" and "dirctl import --sign" call
+// it and report the certificate with PrintCertificate.
 func Sign(ctx context.Context, c *client.Client, recordCID string, stderr io.Writer) (*signv1.Signature, error) {
 	return signRecord(ctx, c, recordCID, *opts, stderr)
 }
 
-// CheckFlags reports a flag-bound signing option combination that can never
-// sign, so a command can refuse before it pushes anything.
+// CheckFlags reports flag-bound signing options that can never sign: a
+// combination that is invalid, or a --certificate file that cannot be read
+// or holds no certificate. A command calls it before it pushes anything.
 func CheckFlags() error {
-	return checkOptions(*opts)
+	if err := checkOptions(*opts); err != nil {
+		return err
+	}
+
+	_, err := readCertificateBundle(*opts)
+
+	return err
 }
 
 func checkOptions(o Options) error {
@@ -190,10 +196,10 @@ func signProvider(o Options, stderr io.Writer) (*signv1.SignRequestProvider, err
 }
 
 // keyProvider builds a key-based signing request. The key can be a file path,
-// URL, KMS URI, etc.; the certificate is resolved before the password is read
-// so a bad --certificate fails without prompting.
-func keyProvider(o Options, stderr io.Writer) (*signv1.SignRequestProvider, error) {
-	certificate, err := resolveCertificate(o, time.Now(), stderr)
+// URL, KMS URI, etc.; the certificate is read before the password so a bad
+// --certificate fails without prompting.
+func keyProvider(o Options, _ io.Writer) (*signv1.SignRequestProvider, error) {
+	certificate, err := readCertificateBundle(o)
 	if err != nil {
 		return nil, err
 	}
@@ -235,11 +241,10 @@ func oidcProvider(o Options, token string) *signv1.SignRequestProvider {
 	}
 }
 
-// resolveCertificate reads the --certificate PEM bundle and returns it, or ""
-// when none was requested. When no certificate in the bundle is valid at now,
-// each one is reported on stderr before any signing or password prompt; the
-// client attaches a valid one when there is any.
-func resolveCertificate(o Options, now time.Time, stderr io.Writer) (string, error) {
+// readCertificateBundle reads the --certificate PEM bundle and returns it, or
+// "" when none was requested. Which certificate the bundle contributes is the
+// client's choice, so its validity is reported once it is attached.
+func readCertificateBundle(o Options) (string, error) {
 	if o.Certificate == "" {
 		return "", nil
 	}
@@ -249,24 +254,8 @@ func resolveCertificate(o Options, now time.Time, stderr io.Writer) (string, err
 		return "", fmt.Errorf("reading certificate file: %w", err)
 	}
 
-	certs, err := cosignutil.ParseCertificateBundle(data)
-	if err != nil {
+	if _, err := cosignutil.ParseCertificateBundle(data); err != nil {
 		return "", fmt.Errorf("certificate file %q: %w", o.Certificate, err)
-	}
-
-	warnings := make([]string, 0, len(certs))
-
-	for _, cert := range certs {
-		warning := certificateValidityWarning(cert, now)
-		if warning == "" {
-			return string(data), nil
-		}
-
-		warnings = append(warnings, warning)
-	}
-
-	for _, warning := range warnings {
-		warn(stderr, warning)
 	}
 
 	return string(data), nil
@@ -286,7 +275,7 @@ func (o signOutcome) String() string {
 // printSignResult reports the stored signature. A key-based signature with a
 // certificate also reports the certificate's fingerprint.
 func printSignResult(cmd *cobra.Command, sig *signv1.Signature) error {
-	cert, ok := attachedCertificate(sig, cmd.ErrOrStderr())
+	cert, ok := attachedCertificate(sig, time.Now(), cmd.ErrOrStderr())
 	if !ok {
 		return presenter.PrintMessage(cmd, "signature", "Record is", "signed")
 	}
@@ -302,7 +291,7 @@ func printSignResult(cmd *cobra.Command, sig *signv1.Signature) error {
 // structured formats get it on stderr. A signature without a certificate
 // prints nothing.
 func PrintCertificate(cmd *cobra.Command, sig *signv1.Signature) {
-	cert, ok := attachedCertificate(sig, cmd.ErrOrStderr())
+	cert, ok := attachedCertificate(sig, time.Now(), cmd.ErrOrStderr())
 	if !ok {
 		return
 	}
@@ -310,10 +299,12 @@ func PrintCertificate(cmd *cobra.Command, sig *signv1.Signature) {
 	presenter.PrintSmartf(cmd, "Signed with certificate %s\n", certificateFingerprint(cert))
 }
 
-// attachedCertificate decodes the certificate of a key-based signature. One
-// that cannot be decoded is reported as a warning rather than an error: the
-// signature is already stored, so the command has done its work.
-func attachedCertificate(sig *signv1.Signature, stderr io.Writer) (*x509.Certificate, bool) {
+// attachedCertificate decodes the certificate of a key-based signature and
+// warns when it is outside its validity period at now, since the reconciler
+// will reject it. One that cannot be decoded is reported as a warning rather
+// than an error: the signature is already stored, so the command has done its
+// work.
+func attachedCertificate(sig *signv1.Signature, now time.Time, stderr io.Writer) (*x509.Certificate, bool) {
 	encoded, ok := sig.KeyCertificate()
 	if !ok {
 		return nil, false
@@ -324,6 +315,10 @@ func attachedCertificate(sig *signv1.Signature, stderr io.Writer) (*x509.Certifi
 		warn(stderr, fmt.Sprintf("the stored signature carries a certificate this dirctl cannot decode: %v", err))
 
 		return nil, false
+	}
+
+	if warning := certificateValidityWarning(cert, now); warning != "" {
+		warn(stderr, warning)
 	}
 
 	return cert, true
@@ -352,11 +347,11 @@ func certificateFingerprint(cert *x509.Certificate) string {
 func certificateValidityWarning(cert *x509.Certificate, now time.Time) string {
 	switch {
 	case now.Before(cert.NotBefore):
-		return fmt.Sprintf("certificate %s is not valid before %s; a record signed with it fails name verification until then",
+		return fmt.Sprintf("certificate %s is not valid before %s; the record fails name verification until its first re-check after that time",
 			certificateFingerprint(cert), cert.NotBefore.UTC().Format(time.RFC3339))
 
 	case now.After(cert.NotAfter):
-		return fmt.Sprintf("certificate %s expired at %s; a record signed with it fails name verification until the certificate is renewed and the record re-signed",
+		return fmt.Sprintf("certificate %s expired at %s; the record fails name verification until it is re-signed with a renewed certificate",
 			certificateFingerprint(cert), cert.NotAfter.UTC().Format(time.RFC3339))
 
 	default:

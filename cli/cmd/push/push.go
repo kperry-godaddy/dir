@@ -115,7 +115,7 @@ func runCommand(cmd *cobra.Command, source io.Reader) error {
 	if opts.Sign {
 		sig, err := signcmd.Sign(cmd.Context(), c, recordRef.GetCid(), cmd.ErrOrStderr())
 		if err != nil {
-			return err
+			return fmt.Errorf("pushed record %s but could not sign it: %w", recordRef.GetCid(), err)
 		}
 
 		signcmd.PrintCertificate(cmd, sig)

@@ -350,7 +350,7 @@ func TestAddSigningFlagsRegistersCertificate(t *testing.T) {
 	}
 }
 
-func TestResolveCertificate(t *testing.T) {
+func TestReadCertificateBundle(t *testing.T) {
 	t.Parallel()
 
 	now := time.Date(2026, time.September, 11, 12, 0, 0, 0, time.UTC)
@@ -358,17 +358,15 @@ func TestResolveCertificate(t *testing.T) {
 	cert := newTestCertificate(t, key, now.Add(-time.Hour), now.Add(time.Hour))
 	expired := newTestCertificate(t, key, now.Add(-2*time.Hour), now.Add(-time.Hour))
 	certPath := writeTestFile(t, "identity-cert.pem", certificatePEM(cert))
-	expiredPath := writeTestFile(t, "expired-cert.pem", certificatePEM(expired))
 	chainPath := writeTestFile(t, "chain.pem", append(certificatePEM(cert), certificatePEM(expired)...))
 	publicKeyPath := writeTestFile(t, "key.pub", pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: []byte("not a certificate")}))
 	keyPath := writeTestFile(t, "identity-key.pem", privateKeyPEM(t, key))
 
 	tests := []struct {
-		name        string
-		options     Options
-		want        string
-		wantErr     string
-		wantWarning string
+		name    string
+		options Options
+		want    string
+		wantErr string
 	}{
 		{
 			name:    "no certificate requested",
@@ -390,18 +388,12 @@ func TestResolveCertificate(t *testing.T) {
 			wantErr: "contains a private key block",
 		},
 		{
-			name:    "valid certificate",
+			name:    "single certificate",
 			options: Options{Key: "cosign.key", Certificate: certPath},
 			want:    string(certificatePEM(cert)),
 		},
 		{
-			name:        "expired certificate warns before signing",
-			options:     Options{Key: "cosign.key", Certificate: expiredPath},
-			want:        string(certificatePEM(expired)),
-			wantWarning: "Warning: certificate " + certificateFingerprint(expired) + " expired at 2026-09-11T11:00:00Z",
-		},
-		{
-			name:    "chain with a valid certificate does not warn about the expired one",
+			name:    "chain is passed on whole",
 			options: Options{Key: "cosign.key", Certificate: chainPath},
 			want:    string(append(certificatePEM(cert), certificatePEM(expired)...)),
 		},
@@ -411,29 +403,21 @@ func TestResolveCertificate(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			var stderr bytes.Buffer
-
-			got, err := resolveCertificate(tt.options, now, &stderr)
+			got, err := readCertificateBundle(tt.options)
 			if tt.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
-					t.Fatalf("resolveCertificate() error = %v, want containing %q", err, tt.wantErr)
+					t.Fatalf("readCertificateBundle() error = %v, want containing %q", err, tt.wantErr)
 				}
 
 				return
 			}
 
 			if err != nil {
-				t.Fatalf("resolveCertificate() error = %v", err)
+				t.Fatalf("readCertificateBundle() error = %v", err)
 			}
 
 			if got != tt.want {
-				t.Fatalf("resolveCertificate() = %q, want %q", got, tt.want)
-			}
-
-			assertStderr(t, &stderr, tt.wantWarning)
-
-			if tt.wantWarning != "" && strings.Count(stderr.String(), "Warning:") != 1 {
-				t.Fatalf("stderr = %q, want exactly one warning", stderr.String())
+				t.Fatalf("readCertificateBundle() = %q, want %q", got, tt.want)
 			}
 		})
 	}
@@ -675,6 +659,8 @@ func TestPrintSignResult(t *testing.T) {
 	now := time.Now()
 	cert := newTestCertificate(t, newTestKey(t), now.Add(-time.Hour), now.Add(time.Hour))
 	encoded := base64.StdEncoding.EncodeToString(cert.Raw)
+	expired := newTestCertificate(t, newTestKey(t), now.Add(-2*time.Hour), now.Add(-time.Hour))
+	encodedExpired := base64.StdEncoding.EncodeToString(expired.Raw)
 
 	tests := []struct {
 		name       string
@@ -684,6 +670,13 @@ func TestPrintSignResult(t *testing.T) {
 		wantJSON   map[string]any
 		wantStderr string
 	}{
+		{
+			name:       "expired certificate is reported once attached",
+			format:     "human",
+			signature:  &signv1.Signature{Signature: "c2ln", Certificate: encodedExpired},
+			wantStdout: "Record is: signed (certificate " + certificateFingerprint(expired) + ")\n",
+			wantStderr: "Warning: certificate " + certificateFingerprint(expired) + " expired at",
+		},
 		{
 			name:       "human without certificate",
 			format:     "human",
@@ -773,6 +766,7 @@ func TestPrintCertificate(t *testing.T) {
 	cert := newTestCertificate(t, newTestKey(t), now.Add(-time.Hour), now.Add(time.Hour))
 	encoded := base64.StdEncoding.EncodeToString(cert.Raw)
 	summary := "Signed with certificate " + certificateFingerprint(cert) + "\n"
+	expired := newTestCertificate(t, newTestKey(t), now.Add(-2*time.Hour), now.Add(-time.Hour))
 
 	tests := []struct {
 		name       string
@@ -781,6 +775,13 @@ func TestPrintCertificate(t *testing.T) {
 		wantStdout string
 		wantStderr string
 	}{
+		{
+			name:       "expired certificate warns",
+			format:     "human",
+			signature:  &signv1.Signature{Signature: "c2ln", Certificate: base64.StdEncoding.EncodeToString(expired.Raw)},
+			wantStdout: "Signed with certificate " + certificateFingerprint(expired) + "\n",
+			wantStderr: "Warning: certificate " + certificateFingerprint(expired) + " expired at",
+		},
 		{
 			name:       "human prints the fingerprint on stdout",
 			format:     "human",
@@ -910,10 +911,9 @@ func TestSignRecord(t *testing.T) {
 			options: Options{Key: keyPath},
 		},
 		{
-			name:            "expired certificate is warned about and still attached",
+			name:            "expired certificate is attached; its validity is reported once the result is printed",
 			options:         Options{Key: keyPath, Certificate: expiredPath},
 			wantCertificate: base64.StdEncoding.EncodeToString(expired.Raw),
-			wantStderr:      "Warning: certificate " + certificateFingerprint(expired) + " expired at",
 		},
 		{
 			name:    "certificate without key fails before signing",
@@ -1078,6 +1078,42 @@ func TestCheckOptions(t *testing.T) {
 
 			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("checkOptions() error = %v, want containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCheckFlags(t *testing.T) {
+	now := time.Now()
+	key := newTestKey(t)
+	certPath := writeTestFile(t, "identity-cert.pem", certificatePEM(newTestCertificate(t, key, now.Add(-time.Hour), now.Add(time.Hour))))
+
+	tests := []struct {
+		name    string
+		options Options
+		wantErr string
+	}{
+		{name: "key alone", options: Options{Key: "cosign.key"}},
+		{name: "key with a readable certificate", options: Options{Key: "cosign.key", Certificate: certPath}},
+		{name: "certificate without key", options: Options{Certificate: certPath}, wantErr: "--certificate requires --key"},
+		{name: "missing certificate file", options: Options{Key: "cosign.key", Certificate: filepath.Join(t.TempDir(), "missing.pem")}, wantErr: "reading certificate file"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			withOptions(t, tt.options)
+
+			err := CheckFlags()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("CheckFlags() error = %v", err)
+				}
+
+				return
+			}
+
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("CheckFlags() error = %v, want containing %q", err, tt.wantErr)
 			}
 		})
 	}

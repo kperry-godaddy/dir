@@ -5,6 +5,7 @@ package oci
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 
@@ -15,18 +16,38 @@ import (
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"oras.land/oras-go/v2"
+	"oras.land/oras-go/v2/errdef"
 )
 
 var referrersLogger = logging.Logger("store/oci/referrers")
 
-// ReferrerMatcher defines a function type for matching OCI referrer descriptors.
-// It returns true if the descriptor matches the expected referrer type.
-type ReferrerMatcher func(ctx context.Context, referrer ocispec.Descriptor) bool
+// ReferrerMatcher reports whether a referrer descriptor is of the expected
+// referrer type. Its error means the descriptor could not be read.
+type ReferrerMatcher func(ctx context.Context, referrer ocispec.Descriptor) (bool, error)
 
 // ReferrersLister interface for repositories that support the OCI Referrers API.
 type ReferrersLister interface {
 	Referrers(ctx context.Context, desc ocispec.Descriptor, artifactType string, fn func(referrers []ocispec.Descriptor) error) error
 }
+
+// errMalformedReferrer marks a listed referrer whose content is not a
+// referrer. Anyone who can push referrers can attach one, so a walk skips it
+// rather than let it hide the record's other referrers.
+var errMalformedReferrer = errors.New("referrer content does not decode")
+
+// unreadablePolicy is what a walk does with a referrer whose manifest or blob
+// cannot be read from the registry.
+type unreadablePolicy int
+
+const (
+	// failOnUnreadable ends the walk with the read error, so the caller never
+	// takes a partial list of referrers for the whole.
+	failOnUnreadable unreadablePolicy = iota
+
+	// skipUnreadable logs the referrer and continues. Deletion uses it so that
+	// the readable referrers of a record stay deletable.
+	skipUnreadable
+)
 
 // PushReferrer pushes a generic RecordReferrer as an OCI artifact that references a record as its subject.
 // For signature referrers, it uses cosign to attach the signature.
@@ -139,12 +160,14 @@ func (s *store) pushReferrer(ctx context.Context, recordCID string, referrer *co
 
 // WalkReferrers walks through referrers for a given record CID, calling walkFn for each referrer.
 // If referrerType is empty, all referrers are walked, otherwise only referrers of the specified type.
+// A referrer whose content does not decode is skipped and logged. A referrer that cannot be read
+// ends the walk with the error, so the caller never takes a partial list for the whole.
 func (s *store) WalkReferrers(ctx context.Context, recordCID string, referrerType string, walkFn func(*corev1.RecordReferrer) error) error {
 	if walkFn == nil {
 		return status.Error(codes.InvalidArgument, "walkFn is required") //nolint:wrapcheck
 	}
 
-	return s.walkReferrers(ctx, recordCID, referrerType,
+	return s.walkReferrers(ctx, recordCID, referrerType, failOnUnreadable,
 		func(referrer *corev1.RecordReferrer, _ ocispec.Descriptor) error {
 			return walkFn(referrer)
 		},
@@ -156,7 +179,7 @@ func (s *store) WalkReferrers(ctx context.Context, recordCID string, referrerTyp
 // Deletion needs that descriptor: a referrer CID addresses the referrer's blob, not its manifest,
 // so the manifest is reachable only by its own digest or by a tag - and the tag is what we are
 // removing.
-func (s *store) walkReferrers(ctx context.Context, recordCID string, referrerType string, walkFn func(*corev1.RecordReferrer, ocispec.Descriptor) error) error {
+func (s *store) walkReferrers(ctx context.Context, recordCID string, referrerType string, policy unreadablePolicy, walkFn func(*corev1.RecordReferrer, ocispec.Descriptor) error) error {
 	referrersLogger.Debug("Walking referrers from OCI store", "recordCID", recordCID, "type", referrerType)
 
 	if recordCID == "" {
@@ -187,34 +210,18 @@ func (s *store) walkReferrers(ctx context.Context, recordCID string, referrerTyp
 	referrersLister, ok := s.repo.(ReferrersLister)
 	if !ok {
 		// Fall back to graph Predecessors for local OCI stores
-		return s.walkReferrersViaPredecessors(ctx, recordManifestDesc, recordCID, matcher, walkFn)
+		return s.walkReferrersViaPredecessors(ctx, recordManifestDesc, recordCID, matcher, policy, walkFn)
 	}
 
 	var walkErr error
 
 	err = referrersLister.Referrers(ctx, recordManifestDesc, "", func(referrers []ocispec.Descriptor) error {
 		for _, referrerDesc := range referrers {
-			// Apply matcher if specified
-			if matcher != nil && !matcher(ctx, referrerDesc) {
-				continue
-			}
-
-			// Extract referrer data from manifest
-			referrer, err := s.extractReferrerFromManifest(ctx, referrerDesc, recordCID)
-			if err != nil {
-				referrersLogger.Error("Failed to extract referrer from manifest", "digest", referrerDesc.Digest.String(), "error", err)
-
-				continue // Skip this referrer but continue with others
-			}
-
-			// Call the walk function
-			if err := walkFn(referrer, referrerDesc); err != nil {
+			if err := s.visitReferrer(ctx, referrerDesc, recordCID, matcher, policy, walkFn); err != nil {
 				walkErr = err
 
 				return err // Stop walking on error
 			}
-
-			referrersLogger.Debug("Referrer processed successfully", "digest", referrerDesc.Digest.String(), "type", referrer.GetType())
 		}
 
 		return nil // Continue with next batch
@@ -234,7 +241,7 @@ func (s *store) walkReferrers(ctx context.Context, recordCID string, referrerTyp
 }
 
 // walkReferrersViaPredecessors walks referrers using the graph Predecessors API.
-func (s *store) walkReferrersViaPredecessors(ctx context.Context, subjectDesc ocispec.Descriptor, recordCID string, matcher ReferrerMatcher, walkFn func(*corev1.RecordReferrer, ocispec.Descriptor) error) error {
+func (s *store) walkReferrersViaPredecessors(ctx context.Context, subjectDesc ocispec.Descriptor, recordCID string, matcher ReferrerMatcher, policy unreadablePolicy, walkFn func(*corev1.RecordReferrer, ocispec.Descriptor) error) error {
 	predecessors, err := s.repo.Predecessors(ctx, subjectDesc)
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to get predecessors for manifest %s: %v", subjectDesc.Digest.String(), err)
@@ -245,22 +252,9 @@ func (s *store) walkReferrersViaPredecessors(ctx context.Context, subjectDesc oc
 			continue
 		}
 
-		if matcher != nil && !matcher(ctx, predDesc) {
-			continue
-		}
-
-		referrer, err := s.extractReferrerFromManifest(ctx, predDesc, recordCID)
-		if err != nil {
-			referrersLogger.Error("Failed to extract referrer from manifest", "digest", predDesc.Digest.String(), "error", err)
-
-			continue
-		}
-
-		if err := walkFn(referrer, predDesc); err != nil {
+		if err := s.visitReferrer(ctx, predDesc, recordCID, matcher, policy, walkFn); err != nil {
 			return err
 		}
-
-		referrersLogger.Debug("Referrer processed successfully", "digest", predDesc.Digest.String(), "type", referrer.GetType())
 	}
 
 	referrersLogger.Debug("Successfully walked referrers via predecessors", "recordCID", recordCID)
@@ -268,7 +262,55 @@ func (s *store) walkReferrersViaPredecessors(ctx context.Context, subjectDesc oc
 	return nil
 }
 
-// extractReferrerFromManifest extracts the referrer data from a referrer manifest.
+// visitReferrer reads one listed referrer and hands it to walkFn. Content that
+// does not decode is skipped; a referrer that cannot be read is skipped or ends
+// the walk as policy says. An error from walkFn is returned as is.
+func (s *store) visitReferrer(ctx context.Context, desc ocispec.Descriptor, recordCID string, matcher ReferrerMatcher, policy unreadablePolicy, walkFn func(*corev1.RecordReferrer, ocispec.Descriptor) error) error {
+	if matcher != nil {
+		match, err := matcher(ctx, desc)
+		if err != nil {
+			return unreadable(desc, err, policy)
+		}
+
+		if !match {
+			return nil
+		}
+	}
+
+	referrer, err := s.extractReferrerFromManifest(ctx, desc, recordCID)
+	if err != nil {
+		if errors.Is(err, errMalformedReferrer) {
+			referrersLogger.Warn("Skipping referrer whose content does not decode", "digest", desc.Digest.String(), "error", err)
+
+			return nil
+		}
+
+		return unreadable(desc, err, policy)
+	}
+
+	if err := walkFn(referrer, desc); err != nil {
+		return err
+	}
+
+	referrersLogger.Debug("Referrer processed successfully", "digest", desc.Digest.String(), "type", referrer.GetType())
+
+	return nil
+}
+
+// unreadable applies the walk's policy to a referrer that could not be read.
+func unreadable(desc ocispec.Descriptor, err error, policy unreadablePolicy) error {
+	if policy == skipUnreadable {
+		referrersLogger.Error("Skipping referrer that cannot be read", "digest", desc.Digest.String(), "error", err)
+
+		return nil
+	}
+
+	return err
+}
+
+// extractReferrerFromManifest extracts the referrer data from a referrer manifest. A manifest or
+// blob that cannot be read yields the read error; content that is not a referrer yields an error
+// wrapping errMalformedReferrer.
 func (s *store) extractReferrerFromManifest(ctx context.Context, manifestDesc ocispec.Descriptor, recordCID string) (*corev1.RecordReferrer, error) {
 	manifest, err := s.fetchAndParseManifestFromDescriptor(ctx, manifestDesc)
 	if err != nil {
@@ -276,14 +318,18 @@ func (s *store) extractReferrerFromManifest(ctx context.Context, manifestDesc oc
 	}
 
 	if len(manifest.Layers) == 0 {
-		return nil, status.Errorf(codes.Internal, "referrer manifest has no layers")
+		return nil, fmt.Errorf("%w: referrer manifest %s has no layers", errMalformedReferrer, manifestDesc.Digest.String())
 	}
 
 	blobDesc := manifest.Layers[0]
 
 	reader, err := s.repo.Fetch(ctx, blobDesc)
 	if err != nil {
-		return nil, status.Errorf(codes.NotFound, "referrer blob not found for CID %s: %v", recordCID, err)
+		if errors.Is(err, errdef.ErrNotFound) {
+			return nil, status.Errorf(codes.NotFound, "referrer blob %s not found for CID %s: %v", blobDesc.Digest.String(), recordCID, err)
+		}
+
+		return nil, status.Errorf(codes.Internal, "failed to fetch referrer blob %s for CID %s: %v", blobDesc.Digest.String(), recordCID, err)
 	}
 	defer reader.Close()
 
@@ -294,9 +340,8 @@ func (s *store) extractReferrerFromManifest(ctx context.Context, manifestDesc oc
 
 	referrer := &corev1.RecordReferrer{}
 
-	// Try to unmarshal the referrer from JSON
 	if err := protojson.Unmarshal(referrerData, referrer); err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to unmarshal referrer for CID %s: %v", recordCID, err)
+		return nil, fmt.Errorf("%w: referrer blob %s for CID %s: %w", errMalformedReferrer, blobDesc.Digest.String(), recordCID, err)
 	}
 
 	// Map internal OCI artifact type back to Dir API type
@@ -311,7 +356,7 @@ func (s *store) extractReferrerFromManifest(ctx context.Context, manifestDesc oc
 	if !ok {
 		referrerCID, err = corev1.ConvertDigestToCID(blobDesc.Digest)
 		if err != nil {
-			return nil, status.Errorf(codes.Internal, "failed to derive referrer CID for record %s: %v", recordCID, err)
+			return nil, fmt.Errorf("%w: referrer blob digest %s for CID %s: %w", errMalformedReferrer, blobDesc.Digest.String(), recordCID, err)
 		}
 	}
 
@@ -322,16 +367,13 @@ func (s *store) extractReferrerFromManifest(ctx context.Context, manifestDesc oc
 
 // MediaTypeReferrerMatcher creates a ReferrerMatcher that checks for a specific media type.
 func (s *store) MediaTypeReferrerMatcher(expectedMediaType string) ReferrerMatcher {
-	return func(ctx context.Context, referrer ocispec.Descriptor) bool {
+	return func(ctx context.Context, referrer ocispec.Descriptor) (bool, error) {
 		manifest, err := s.fetchAndParseManifestFromDescriptor(ctx, referrer)
 		if err != nil {
-			referrersLogger.Debug("Failed to fetch and parse referrer manifest", "digest", referrer.Digest.String(), "error", err)
-
-			return false
+			return false, err
 		}
 
-		// Check if this manifest contains a layer with the expected media type
-		return len(manifest.Layers) > 0 && manifest.Layers[0].MediaType == expectedMediaType
+		return len(manifest.Layers) > 0 && manifest.Layers[0].MediaType == expectedMediaType, nil
 	}
 }
 
@@ -397,7 +439,7 @@ func (s *store) deleteReferrers(
 	// set being iterated.
 	var targets []target
 
-	err := s.walkReferrers(ctx, recordCID, referrerType,
+	err := s.walkReferrers(ctx, recordCID, referrerType, skipUnreadable,
 		func(referrer *corev1.RecordReferrer, desc ocispec.Descriptor) error {
 			cid := referrer.GetReferrerRef().GetCid()
 			if cid == "" || !match(cid) {

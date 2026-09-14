@@ -451,3 +451,48 @@ func TestRejectedCertificatesCount(t *testing.T) {
 	assert.Equal(t, rejectedCertificates{oversized: 1, malformed: 2, unsupportedKey: 1, unbound: 1}, rejected)
 	assert.Equal(t, 5, rejected.total())
 }
+
+// cosign signs a KMS-held key under SHA-256 whatever its curve; the binding
+// accepts that signature next to one under the curve's own hash, and still
+// rejects a SHA-256 signature by another key.
+func TestCertificateSigners_BindsSHA256SignaturesOfEveryCurve(t *testing.T) {
+	tests := []struct {
+		name  string
+		curve elliptic.Curve
+	}{
+		{name: "ecdsa p-256", curve: elliptic.P256()},
+		{name: "ecdsa p-384", curve: elliptic.P384()},
+		{name: "ecdsa p-521", curve: elliptic.P521()},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			id := newTestIdentityWithKey(t, newECDSAKey(t, tc.curve), signersTestSAN)
+			other := newECDSAKey(t, tc.curve)
+
+			signers, _, err := certificateSigners(t.Context(), signersTestCID, []*signv1.Signature{
+				{Signature: signPayloadSHA256(t, other, signersTestCID), Certificate: encodeCert(id.cert)},
+				{Signature: signPayloadSHA256(t, id.key, signersTestCID), Certificate: encodeCert(id.cert)},
+			})
+			require.NoError(t, err)
+
+			require.Len(t, signers, 1)
+			assert.Equal(t, mustMarshalKey(t, id.key.Public()), signers[0].Key)
+			assert.Equal(t, id.cert.Raw, signers[0].Certificate)
+		})
+	}
+}
+
+// signPayloadSHA256 produces what cosign produces for a KMS-held key: the
+// payload signed under SHA-256 whatever the curve.
+func signPayloadSHA256(t *testing.T, key crypto.Signer, payload string) string {
+	t.Helper()
+
+	sv, err := signature.LoadSignerVerifier(key, crypto.SHA256)
+	require.NoError(t, err)
+
+	sig, err := sv.SignMessage(bytes.NewReader([]byte(payload)))
+	require.NoError(t, err)
+
+	return base64.StdEncoding.EncodeToString(sig)
+}

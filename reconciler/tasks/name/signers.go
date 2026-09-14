@@ -6,6 +6,9 @@ package name
 import (
 	"bytes"
 	"context"
+	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/x509"
 	"encoding/base64"
 	"fmt"
@@ -145,9 +148,10 @@ func certificateSigners(ctx context.Context, cid string, sigs []*signv1.Signatur
 
 // boundCertificate parses the certificate attached to a key-based signature
 // and returns it only when its key verifies the signature over the CID under
-// the algorithm the registry signs with for that key type; otherwise it says
-// why the certificate was rejected. The verifier is built from the parsed key,
-// never from a string, so no key reference of any kind is ever resolved here.
+// an algorithm the registry signs with for that key type; otherwise it says
+// why the certificate was rejected. The verifiers are built from the parsed
+// key, never from a string, so no key reference of any kind is ever resolved
+// here.
 func boundCertificate(cid string, sig *signv1.Signature) (*x509.Certificate, certificateRejection) {
 	encodedCert, ok := sig.KeyCertificate()
 	if !ok {
@@ -189,18 +193,57 @@ func boundCertificate(cid string, sig *signv1.Signature) (*x509.Certificate, cer
 		return nil, rejectionMalformed
 	}
 
-	verifier, err := signature.LoadDefaultVerifier(cert.PublicKey, options.WithED25519ph())
+	verifiers, err := keyVerifiers(cert.PublicKey)
 	if err != nil {
 		logger.Debug("Skipping signature: unsupported certificate key", "cid", cid, "error", err)
 
 		return nil, rejectionUnsupportedKey
 	}
 
-	if err := verifier.VerifySignature(bytes.NewReader(sigBytes), bytes.NewReader([]byte(cid))); err != nil {
+	if err := verifyAny(verifiers, sigBytes, []byte(cid)); err != nil {
 		logger.Debug("Skipping signature: certificate key did not produce it", "cid", cid, "error", err)
 
 		return nil, rejectionUnbound
 	}
 
 	return cert, rejectionNone
+}
+
+// keyVerifiers returns one verifier per algorithm the registry signs with for
+// the key type. cosign signs a file key under its curve's own hash but a
+// KMS-held key under SHA-256 whatever the curve, which HashiCorp Vault honors
+// while AWS, GCP, and Azure derive the hash from the key; sigstore's algorithm
+// registry lists both hashes for P-384 and P-521.
+func keyVerifiers(pub crypto.PublicKey) ([]signature.Verifier, error) {
+	primary, err := signature.LoadDefaultVerifier(pub, options.WithED25519ph())
+	if err != nil {
+		return nil, err //nolint:wrapcheck // logged with its context by the caller
+	}
+
+	verifiers := []signature.Verifier{primary}
+
+	if key, ok := pub.(*ecdsa.PublicKey); ok && key.Curve != elliptic.P256() {
+		sha256Verifier, err := signature.LoadECDSAVerifier(key, crypto.SHA256)
+		if err != nil {
+			return nil, err //nolint:wrapcheck // logged with its context by the caller
+		}
+
+		verifiers = append(verifiers, sha256Verifier)
+	}
+
+	return verifiers, nil
+}
+
+// verifyAny accepts the signature when any verifier does and otherwise returns
+// the last verifier's error.
+func verifyAny(verifiers []signature.Verifier, sig, message []byte) error {
+	var err error
+
+	for _, verifier := range verifiers {
+		if err = verifier.VerifySignature(bytes.NewReader(sig), bytes.NewReader(message)); err == nil {
+			return nil
+		}
+	}
+
+	return fmt.Errorf("no algorithm of the key type verifies the signature: %w", err)
 }

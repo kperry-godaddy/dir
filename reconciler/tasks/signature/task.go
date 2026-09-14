@@ -203,7 +203,9 @@ func NewStoreFetcher(store types.ReferrerStoreAPI) verify.Fetcher {
 	return &storeFetcher{store: store}
 }
 
-// PullSignatures implements verify.Fetcher.
+// PullSignatures implements verify.Fetcher. A referrer whose payload does not
+// decode as a signature is skipped and logged: anyone who can push referrers
+// can attach one, and it must not hide the record's signatures.
 func (s *storeFetcher) PullSignatures(ctx context.Context, recordRef *corev1.RecordRef) ([]*signv1.Signature, error) {
 	recordCID := recordRef.GetCid()
 
@@ -212,7 +214,10 @@ func (s *storeFetcher) PullSignatures(ctx context.Context, recordRef *corev1.Rec
 	err := s.store.WalkReferrers(ctx, recordCID, corev1.SignatureReferrerType, func(ref *corev1.RecordReferrer) error {
 		sig := &signv1.Signature{}
 		if err := sig.UnmarshalReferrer(ref); err != nil {
-			return fmt.Errorf("unmarshal signature referrer: %w", err)
+			logger.Warn("Skipping referrer that does not decode as a signature",
+				"cid", recordCID, "referrerCid", ref.GetReferrerRef().GetCid(), "error", err)
+
+			return nil //nolint:nilerr // content that is not a signature is not evidence
 		}
 
 		out = append(out, sig)
@@ -226,7 +231,8 @@ func (s *storeFetcher) PullSignatures(ctx context.Context, recordRef *corev1.Rec
 	return out, nil
 }
 
-// PullPublicKeys implements verify.Fetcher.
+// PullPublicKeys implements verify.Fetcher. A referrer whose payload does not
+// decode as a public key is skipped and logged.
 func (s *storeFetcher) PullPublicKeys(ctx context.Context, recordRef *corev1.RecordRef) ([]string, error) {
 	recordCID := recordRef.GetCid()
 
@@ -235,9 +241,10 @@ func (s *storeFetcher) PullPublicKeys(ctx context.Context, recordRef *corev1.Rec
 	err := s.store.WalkReferrers(ctx, recordCID, corev1.PublicKeyReferrerType, func(ref *corev1.RecordReferrer) error {
 		pk := &signv1.PublicKey{}
 		if err := pk.UnmarshalReferrer(ref); err != nil {
-			// Skip invalid referrer; continue walk.
-			//nolint:nilerr
-			return nil
+			logger.Warn("Skipping referrer that does not decode as a public key",
+				"cid", recordCID, "referrerCid", ref.GetReferrerRef().GetCid(), "error", err)
+
+			return nil //nolint:nilerr // content that is not a public key is not evidence
 		}
 
 		if k := pk.GetKey(); k != "" {

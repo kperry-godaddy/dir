@@ -42,7 +42,7 @@ The name task verifies ownership of named records and caches results. The protoc
 It:
 
 1. Queries the database for signed records with verifiable names that have no verification, a verdict older than `name.ttl` minus one `name.interval` (so a verified record is re-verified before the API stops serving it), or a scheduled retry that is due
-2. For each record, collects the signers: the certificates bound to the record's signatures (a certificate counts only when its key produced the signature over the record CID) and the public keys attached to the record. When part of this evidence cannot be read, a verdict against the rest is withheld and the record is `pending`; a verdict for it stands
+2. For each record, collects the signers: the certificates bound to the record's signatures (a certificate counts only when its key produced the signature over the record CID) and the public keys attached to the record. When part of this evidence cannot be read, a verdict against the rest is withheld and the record is `pending`; a verdict for it stands. A referrer whose payload does not decode as a signature or public key is skipped and logged, since anyone who can push referrers can attach one; only a referrer the store cannot read counts as evidence that could not be read
 3. Runs the verification method selected by the name's protocol once per record
 4. Stores the result (`verified`, `failed`, or `pending`) in the database for efficient API filtering
 
@@ -71,7 +71,7 @@ The reconciler needs outbound DNS for the `_ans-badge` lookups and HTTPS (port 4
 #### Result states and retries
 
 - `verified` and `failed` are verdicts. A verified row is served until `name.ttl` after the time it verified. It is re-checked one `name.interval` before that (at least half the TTL after verifying); a transient failure at a re-check within the TTL leaves it `verified` and schedules a retry. A failed row is re-checked after `name.ttl`. A revoked agent, a name that does not match the attested one, a missing or unattested certificate and an expired certificate are all `failed`.
-- `pending` means the last attempt failed transiently (DNS or the transparency log unreachable, a log answering anything but a verdict, or the record's signatures could not be read) and no verdict is served. The first retry lands on the next run; each further transient failure doubles the delay, up to 24 hours. A method that reports its dependency as down sets the retry time directly without counting a strike.
+- `pending` means the last attempt failed transiently (DNS or the transparency log unreachable, a log answering anything but a verdict, or the store could not read one of the record's signatures or public keys) and no verdict is served. The first retry lands on the next run; each further transient failure doubles the delay, up to 24 hours. A method that reports its dependency as down sets the retry time directly without counting a strike.
 - When a verified record's re-check fails transiently after its TTL has passed, the record becomes `pending` and keeps the certificate fingerprint, details and verification time it last verified with until a verdict replaces them. A verified record is never demoted by a count of failures.
 - A failed record whose re-check fails transiently keeps `failed` and its own error, and follows the retry schedule.
 - A record that has been `pending` for 24 hours (since its creation, or since the end of its TTL for a record demoted from `verified`) becomes `failed` with `verification unavailable for 24h; last: …`; later attempts follow the retry schedule, at most one a day.
@@ -92,6 +92,7 @@ Then read the reconciler log:
 - `Name verification did not verify`: one line per attempt that did not verify, with `cid`, `recordName`, `method`, `error` (the stored text), `cause` (the text of this attempt's failure, which differs from `error` when a `failed` row keeps its verdict), `transient`, `status` and, when a retry was scheduled, `consecutiveFailures` and `nextAttemptAt`.
 - `Name verification complete`: one line per run with the `verified`, `failed`, `transient`, `skipped`, `deferred`, `aborted` and `persistFailed` counts and `durationMs`.
 - `Could not read the record's signatures` and `Could not read the record's public keys`: the store error behind a row that stores the matching text.
+- `Skipping referrer that does not decode as a signature` and `Skipping referrer that does not decode as a public key`: a referrer attached to the record whose payload is not what its type says; it is ignored and never withholds a verdict. The store logs `Skipping referrer whose content does not decode` for a referrer that is not a referrer at all.
 - `Withholding the verdict`: the verdict the examined evidence produced and what could not be read.
 - `Rejected attached certificates`: how many certificates attached to the record's signatures were set aside and why (`unbound` means the certificate's key did not produce the signature, the copied-certificate case).
 - `No attached certificate names this agent within its validity period`: the bound certificates were set aside by the ANS method, counted by reason.
